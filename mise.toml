@@ -16,7 +16,7 @@ shellcheck = "0.11.0"
 
 [vars]
 # renovate: datasource=docker depName=ghcr.io/armbian/docker-armbian-build
-builder = "ghcr.io/armbian/docker-armbian-build:armbian-debian-trixie-latest@sha256:9f996ac2caf2a6ba697f372cfcfa6342113f7615ce1ec63d462d960983a0cef6"
+builder = "ghcr.io/armbian/docker-armbian-build:armbian-debian-trixie-latest@sha256:c51c8f2a7f388dd4da513b1625c1ae18b58850ea88538eb447edbcf2a65e84ff"
 # renovate: datasource=docker depName=ghcr.io/renovatebot/renovate
 renovate = "ghcr.io/renovatebot/renovate:44.252.7@sha256:da2082c34a7e8aee0fbf50122d71a052ba32ea5f51aeded502b742ad7bc9d5a2"
 # /opi5/armbian, not /armbian: the image has files there, which Docker would copy into
