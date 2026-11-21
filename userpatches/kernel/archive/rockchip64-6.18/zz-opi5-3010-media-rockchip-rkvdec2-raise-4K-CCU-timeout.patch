@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: opi5 <noreply@example.invalid>
+Date: Wed, 12 Aug 2026 00:00:00 +0000
+Subject: [PATCH] media: rockchip: rkvdec2: raise 4K CCU timeout
+
+Linked tasks at 4K and above hit the 0x4ffffff threshold (106.7 ms at the
+fixed 786.432 MHz ACLK) and reset. Use 0x59fffff (120 ms).
+---
+ drivers/media/platform/rockchip/mpp/mpp_rkvdec2_link.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/platform/rockchip/mpp/mpp_rkvdec2_link.c b/drivers/media/platform/rockchip/mpp/mpp_rkvdec2_link.c
+index d1567a72ffd6..9175cae77fe4 100644
+--- a/drivers/media/platform/rockchip/mpp/mpp_rkvdec2_link.c
++++ b/drivers/media/platform/rockchip/mpp/mpp_rkvdec2_link.c
+@@ -1501,6 +1501,12 @@ void rkvdec2_link_session_deinit(struct mpp_session *session)
+ #define RKVDEC2_CCU_TIMEOUT_20MS	(0xefffff)
+ #define RKVDEC2_CCU_TIMEOUT_50MS	(0x2cfffff)
+ #define RKVDEC2_CCU_TIMEOUT_100MS	(0x4ffffff)
++/*
++ * >=4K linked-task budget. 0x59fffff is 94371840 ACLK cycles, or exactly
++ * 120ms at 786.432MHz. It bounds the wait before the existing recovery path
++ * runs while preserving successful linked-task completion.
++ */
++#define RKVDEC2_CCU_TIMEOUT_120MS	(0x59fffff)
+ 
+ static u32 rkvdec2_ccu_get_timeout_threshold(struct rkvdec2_task *task)
+ {
+@@ -1511,7 +1517,7 @@ static u32 rkvdec2_ccu_get_timeout_threshold(struct rkvdec2_task *task)
+ 	else if (pixels < RKVDEC2_4K_PIXELS)
+ 		return RKVDEC2_CCU_TIMEOUT_50MS;
+ 	else
+-		return RKVDEC2_CCU_TIMEOUT_100MS;
++		return RKVDEC2_CCU_TIMEOUT_120MS;
+ }
+ 
+ int rkvdec2_attach_ccu(struct device *dev, struct rkvdec2_dev *dec)

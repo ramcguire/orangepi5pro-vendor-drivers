@@ -1,0 +1,556 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: opi5 <noreply@example.invalid>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH] rknpu: validate pointers and indices from userspace
+
+In DMA_HEAP mode, MEM_SYNC's obj_addr and SUBMIT's task_obj_addr were
+used as kernel pointers, and task_start/task_number indexed the task
+buffer unchecked. Any process with /dev/rknpu could read or corrupt
+kernel memory.
+- Buffers are reference counted. MEM_SYNC and SUBMIT look obj_addr up
+  among the caller's imports and hold a reference; a job holds its task
+  buffer until it is freed.
+- SUBMIT checks every task range against the task buffer's size, and
+  commit checks again.
+- MEM_CREATE without a dma-buf is refused (librknnrt doesn't use it, and
+  its IOVA cursor never moved back).
+- The ioctl argument is zeroed before a short copy_from_user().
+- Job list heads are initialised for every core; abort unlinks a job from
+  every todo list before freeing it.
+- timeout_clean leaves blocking jobs to their waiters, and compares the
+  timeout in ms, not us.
+---
+ drivers/rknpu/src/include/rknpu_job.h |   6 +
+ drivers/rknpu/src/include/rknpu_mem.h |  15 ++-
+ drivers/rknpu/src/rknpu_drv.c         |  12 +-
+ drivers/rknpu/src/rknpu_job.c         | 168 ++++++++++++++++++++------
+ drivers/rknpu/src/rknpu_mem.c         |  72 +++++++++--
+ 5 files changed, 223 insertions(+), 50 deletions(-)
+
+diff --git a/drivers/rknpu/src/include/rknpu_job.h b/drivers/rknpu/src/include/rknpu_job.h
+index 8b9e04c3f57b..0581dc4d39b5 100644
+--- a/drivers/rknpu/src/include/rknpu_job.h
++++ b/drivers/rknpu/src/include/rknpu_job.h
+@@ -26,6 +26,9 @@
+ #define RKNPU_CORE1_MASK 0x02
+ #define RKNPU_CORE2_MASK 0x04
+ 
++struct rknpu_mem_object;
++struct rknpu_session;
++
+ struct rknpu_job {
+ 	struct rknpu_device *rknpu_dev;
+ 	struct list_head head[RKNPU_MAX_CORES];
+@@ -49,6 +52,8 @@ struct rknpu_job {
+ 	ktime_t hw_elapse_time;
+ 	atomic_t submit_count[RKNPU_MAX_CORES];
+ 	int iommu_domain_id;
++	/* opi5: the task buffer, referenced for the job's lifetime */
++	struct rknpu_mem_object *task_obj;
+ };
+ 
+ irqreturn_t rknpu_core0_irq_handler(int irq, void *data);
+@@ -61,6 +66,7 @@ int rknpu_submit_ioctl(struct drm_device *dev, void *data,
+ #endif
+ #ifdef CONFIG_ROCKCHIP_RKNPU_DMA_HEAP
+ int rknpu_submit_ioctl(struct rknpu_device *rknpu_dev,
++		       struct rknpu_session *session,
+ 		       struct rknpu_submit *args);
+ #endif
+ 
+diff --git a/drivers/rknpu/src/include/rknpu_mem.h b/drivers/rknpu/src/include/rknpu_mem.h
+index f154957c103b..be6f963b0c17 100644
+--- a/drivers/rknpu/src/include/rknpu_mem.h
++++ b/drivers/rknpu/src/include/rknpu_mem.h
+@@ -38,11 +38,22 @@ struct rknpu_mem_object {
+ 	unsigned int owner;
+ };
+ 
++struct rknpu_device;
++struct rknpu_session;
++
+ int rknpu_mem_create_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
+ 			   unsigned int cmd, unsigned long data);
+ int rknpu_mem_destroy_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
+ 			    unsigned long data);
+-int rknpu_mem_sync_ioctl(struct rknpu_device *rknpu_dev, unsigned long data);
+-void rknpu_mem_import_free(struct rknpu_mem_object *obj);
++int rknpu_mem_sync_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
++			 unsigned long data);
++/*
++ * Look up obj_addr among the session's buffers and take a reference, or
++ * NULL if it is not one of them.  Drop it with rknpu_mem_put().
++ */
++struct rknpu_mem_object *rknpu_mem_get(struct rknpu_device *rknpu_dev,
++				       struct rknpu_session *session,
++				       __u64 obj_addr);
++void rknpu_mem_put(struct rknpu_mem_object *obj);
+ 
+ #endif
+diff --git a/drivers/rknpu/src/rknpu_drv.c b/drivers/rknpu/src/rknpu_drv.c
+index 0957badd87e6..f6129778bc8f 100644
+--- a/drivers/rknpu/src/rknpu_drv.c
++++ b/drivers/rknpu/src/rknpu_drv.c
+@@ -571,8 +571,8 @@ static int rknpu_release(struct inode *inode, struct file *file)
+ 			(__u64)(uintptr_t)entry, (__u64)entry->dma_addr);
+ 
+ 		list_del(&entry->head);
+-		/* Imports from rknpu_mem.c; it frees them with the unlocked API. */
+-		rknpu_mem_import_free(entry);
++		/* The list's reference; a job still using it holds its own. */
++		rknpu_mem_put(entry);
+ 	}
+ 
+ 	kfree(session);
+@@ -612,6 +612,9 @@ static long rknpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ 	if (size > sizeof(kdata))
+ 		return -EINVAL;
+ 
++	/* opi5: a short size must not leave stack garbage in kdata. */
++	memset(&kdata, 0, sizeof(kdata));
++
+ 	if (dir & _IOC_WRITE) {
+ 		if (copy_from_user(&kdata, uarg, size)) {
+ 			LOG_ERROR("%s: copy_from_user failed\n", __func__);
+@@ -630,7 +633,8 @@ static long rknpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ 		ret = rknpu_action_ioctl(rknpu_dev, &kdata.action);
+ 		break;
+ 	case RKNPU_SUBMIT:
+-		ret = rknpu_submit_ioctl(rknpu_dev, &kdata.submit);
++		ret = rknpu_submit_ioctl(rknpu_dev, file->private_data,
++					 &kdata.submit);
+ 		break;
+ 	case RKNPU_MEM_CREATE:
+ 		ret = rknpu_mem_create_ioctl(rknpu_dev, file, cmd, arg);
+@@ -641,7 +645,7 @@ static long rknpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ 		ret = rknpu_mem_destroy_ioctl(rknpu_dev, file, arg);
+ 		break;
+ 	case RKNPU_MEM_SYNC:
+-		ret = rknpu_mem_sync_ioctl(rknpu_dev, arg);
++		ret = rknpu_mem_sync_ioctl(rknpu_dev, file, arg);
+ 		break;
+ 	default:
+ 		break;
+diff --git a/drivers/rknpu/src/rknpu_job.c b/drivers/rknpu/src/rknpu_job.c
+index c8d5a80083ab..68b092d062a8 100644
+--- a/drivers/rknpu/src/rknpu_job.c
++++ b/drivers/rknpu/src/rknpu_job.c
+@@ -104,6 +104,11 @@ static void rknpu_job_free(struct rknpu_job *job)
+ 	if (job->fence)
+ 		dma_fence_put(job->fence);
+ 
++#ifdef CONFIG_ROCKCHIP_RKNPU_DMA_HEAP
++	if (job->task_obj)
++		rknpu_mem_put(job->task_obj);
++#endif
++
+ 	/*
+ 	 * When args_owner is true, job->args points into the tail of the same
+ 	 * allocation as job (see rknpu_job_alloc). Freeing job also frees args.
+@@ -127,7 +132,8 @@ static void rknpu_job_cleanup_work(struct work_struct *work)
+ }
+ 
+ static inline struct rknpu_job *rknpu_job_alloc(struct rknpu_device *rknpu_dev,
+-						struct rknpu_submit *args)
++						struct rknpu_submit *args,
++						struct rknpu_mem_object *task_obj)
+ {
+ 	struct rknpu_job *job = NULL;
+ 	int i = 0;
+@@ -158,6 +164,14 @@ static inline struct rknpu_job *rknpu_job_alloc(struct rknpu_device *rknpu_dev,
+ 	job->iommu_domain_id = args->iommu_domain_id;
+ 	for (i = 0; i < rknpu_dev->config->num_irqs; i++)
+ 		atomic_set(&job->submit_count[i], 0);
++	/*
++	 * opi5: timeout_clean and abort test and unlink head[j] for every
++	 * core; only the job's own cores were ever initialised, so the rest
++	 * were NULL pointers to list_del_init().
++	 */
++	for (i = 0; i < RKNPU_MAX_CORES; i++)
++		INIT_LIST_HEAD(&job->head[i]);
++	job->task_obj = task_obj;
+ #ifdef CONFIG_ROCKCHIP_RKNPU_DRM_GEM
+ 	task_obj = (struct rknpu_gem_object *)(uintptr_t)args->task_obj_addr;
+ 	if (task_obj)
+@@ -286,8 +300,7 @@ static inline int rknpu_job_subcore_commit_pc(struct rknpu_job *job,
+ 		(struct rknpu_gem_object *)(uintptr_t)args->task_obj_addr;
+ #endif
+ #ifdef CONFIG_ROCKCHIP_RKNPU_DMA_HEAP
+-	struct rknpu_mem_object *task_obj =
+-		(struct rknpu_mem_object *)(uintptr_t)args->task_obj_addr;
++	struct rknpu_mem_object *task_obj = job->task_obj;
+ #endif
+ 	struct rknpu_task *task_base = NULL;
+ 	struct rknpu_task *first_task = NULL;
+@@ -343,6 +356,15 @@ static inline int rknpu_job_subcore_commit_pc(struct rknpu_job *job,
+ 							task_number;
+ 	task_end = task_start + task_number - 1;
+ 
++#ifdef CONFIG_ROCKCHIP_RKNPU_DMA_HEAP
++	/* opi5: rknpu_submit checked this; recheck where it is used. */
++	if (task_start < 0 || task_number <= 0 ||
++	    (size_t)task_end >= task_obj->size / sizeof(struct rknpu_task)) {
++		job->ret = -EINVAL;
++		return job->ret;
++	}
++#endif
++
+ 	task_base = task_obj->kv_addr;
+ 
+ 	first_task = &task_base[task_start];
+@@ -590,6 +612,12 @@ static void rknpu_job_abort(struct rknpu_job *job)
+ 					rknpu_get_task_number(job, i);
+ 			}
+ 		}
++		/*
++		 * opi5: a multi-core job may still be queued on a core
++		 * that never started it; freed while linked, rknpu_job_next()
++		 * would pick it up later.
++		 */
++		list_del_init(&job->head[i]);
+ 	}
+ 	spin_unlock_irqrestore(&rknpu_dev->irq_lock, flags);
+ 
+@@ -710,7 +738,7 @@ irqreturn_t rknpu_core2_irq_handler(int irq, void *data)
+ static void rknpu_job_timeout_clean(struct rknpu_device *rknpu_dev,
+ 				    int core_mask)
+ {
+-	struct rknpu_job *job = NULL;
++	struct rknpu_job *job = NULL, *next;
+ 	unsigned long flags;
+ 	struct rknpu_subcore_data *subcore_data = NULL;
+ 	int num_irqs = rknpu_dev->config->num_irqs;
+@@ -722,9 +750,15 @@ static void rknpu_job_timeout_clean(struct rknpu_device *rknpu_dev,
+ 
+ 		subcore_data = &rknpu_dev->subcore_datas[i];
+ 		job = subcore_data->job;
+-		if (!job ||
++		/*
++		 * opi5: a blocking job belongs to the thread waiting on it
++		 * (it times out and aborts there; its args are on that stack
++		 * and its cleanup_work was never initialised).  timeout is in
++		 * milliseconds, as rknpu_job_wait() treats it.
++		 */
++		if (!job || !(job->flags & RKNPU_JOB_ASYNC) ||
+ 		    ktime_us_delta(ktime_get(), job->timestamp) <
+-			    job->args->timeout)
++			    (s64)job->args->timeout * 1000)
+ 			continue;
+ 
+ 		rknpu_soft_reset(rknpu_dev);
+@@ -751,54 +785,101 @@ static void rknpu_job_timeout_clean(struct rknpu_device *rknpu_dev,
+ 
+ 		schedule_work(&job->cleanup_work);
+ 
+-		/* Drain remaining queued jobs on this core's todo_list. */
+-		do {
+-			spin_lock_irqsave(&rknpu_dev->irq_lock, flags);
++		/*
++		 * Drain the async jobs queued on this core's todo_list.  Blocking
++		 * ones stay queued for their waiters (opi5, as above).
++		 */
++		spin_lock_irqsave(&rknpu_dev->irq_lock, flags);
++		list_for_each_entry_safe(job, next, &subcore_data->todo_list,
++					 head[i]) {
++			if (!(job->flags & RKNPU_JOB_ASYNC))
++				continue;
++			/*
++			 * Same care for queued multi-core jobs:
++			 * unlink from every core's todo_list.
++			 */
++			for (j = 0; j < num_irqs; j++)
++				list_del_init(&job->head[j]);
++			schedule_work(&job->cleanup_work);
++		}
++		spin_unlock_irqrestore(&rknpu_dev->irq_lock, flags);
++	}
++}
+ 
+-			if (!list_empty(&subcore_data->todo_list)) {
+-				job = list_first_entry(
+-					&subcore_data->todo_list,
+-					struct rknpu_job, head[i]);
+-				/*
+-				 * Same care for queued multi-core jobs:
+-				 * unlink from every core's todo_list.
+-				 */
+-				for (j = 0; j < num_irqs; j++) {
+-					if (!list_empty(&job->head[j]))
+-						list_del_init(&job->head[j]);
+-				}
+-			} else {
+-				job = NULL;
+-			}
++/*
++ * opi5: every task range rknpu_job_subcore_commit_pc() may use lies
++ * inside the task buffer.  With one IRQ it uses task_start/task_number;
++ * with several, subcore_task[core] for one or two cores and
++ * subcore_task[core + 2] for three.  An auto mask picks one core later,
++ * so check every core it could pick.
++ */
++static bool rknpu_task_range_ok(__u32 start, __u32 number, size_t count)
++{
++	return number && start < count && number <= count - start &&
++	       start + number <= INT_MAX;
++}
+ 
+-			spin_unlock_irqrestore(&rknpu_dev->irq_lock, flags);
++static int rknpu_check_tasks(struct rknpu_device *rknpu_dev,
++			     struct rknpu_submit *args, size_t size)
++{
++	size_t count = size / sizeof(struct rknpu_task);
++	unsigned int mask = args->core_mask, cores, i;
++
++	if (rknpu_dev->config->num_irqs <= 1)
++		return rknpu_task_range_ok(args->task_start, args->task_number,
++					   count) ? 0 : -EINVAL;
+ 
+-			if (job)
+-				schedule_work(&job->cleanup_work);
+-		} while (job);
++	if (mask == RKNPU_CORE_AUTO_MASK) {
++		mask = rknpu_dev->core_mask;
++		cores = 1;
++	} else {
++		cores = hweight32(mask);
+ 	}
++	for (i = 0; i < rknpu_dev->config->num_irqs; i++) {
++		unsigned int index = cores == 3 ? i + 2 : i;
++
++		if (!(mask & rknpu_core_mask(i)))
++			continue;
++		if (index >= ARRAY_SIZE(args->subcore_task) ||
++		    !rknpu_task_range_ok(args->subcore_task[index].task_start,
++					 args->subcore_task[index].task_number,
++					 count))
++			return -EINVAL;
++	}
++	return 0;
+ }
+ 
++/* Consumes the reference on task_obj (DMA_HEAP), whatever it returns. */
+ static int rknpu_submit(struct rknpu_device *rknpu_dev,
+-			struct rknpu_submit *args)
++			struct rknpu_submit *args,
++			struct rknpu_mem_object *task_obj)
+ {
+ 	struct rknpu_job *job = NULL;
+ 	int ret = -EINVAL;
+ 
+ 	if (args->task_number == 0) {
+ 		LOG_ERROR("invalid rknpu task number!\n");
+-		return -EINVAL;
++		goto err_put;
+ 	}
+ 
+ 	if (args->core_mask > rknpu_dev->core_mask) {
+ 		LOG_ERROR("invalid rknpu core mask: %#x", args->core_mask);
+-		return -EINVAL;
++		goto err_put;
+ 	}
+ 
+-	job = rknpu_job_alloc(rknpu_dev, args);
++#ifdef CONFIG_ROCKCHIP_RKNPU_DMA_HEAP
++	if (rknpu_check_tasks(rknpu_dev, args, task_obj->size)) {
++		LOG_ERROR("task range outside the task buffer (%zu bytes)\n",
++			  (size_t)task_obj->size);
++		goto err_put;
++	}
++#endif
++
++	job = rknpu_job_alloc(rknpu_dev, args, task_obj);
+ 	if (!job) {
+ 		LOG_ERROR("failed to allocate rknpu job!\n");
+-		return -ENOMEM;
++		ret = -ENOMEM;
++		goto err_put;
+ 	}
+ 
+ 	if (args->flags & RKNPU_JOB_FENCE_IN) {
+@@ -881,6 +962,13 @@ static int rknpu_submit(struct rknpu_device *rknpu_dev,
+ 	}
+ 
+ 	return ret;
++
++err_put:
++#ifdef CONFIG_ROCKCHIP_RKNPU_DMA_HEAP
++	if (task_obj)
++		rknpu_mem_put(task_obj);
++#endif
++	return ret;
+ }
+ 
+ #ifdef CONFIG_ROCKCHIP_RKNPU_DRM_GEM
+@@ -890,15 +978,25 @@ int rknpu_submit_ioctl(struct drm_device *dev, void *data,
+ 	struct rknpu_device *rknpu_dev = dev_get_drvdata(dev->dev);
+ 	struct rknpu_submit *args = data;
+ 
+-	return rknpu_submit(rknpu_dev, args);
++	return rknpu_submit(rknpu_dev, args, NULL);
+ }
+ #endif
+ 
+ #ifdef CONFIG_ROCKCHIP_RKNPU_DMA_HEAP
+ int rknpu_submit_ioctl(struct rknpu_device *rknpu_dev,
++		       struct rknpu_session *session,
+ 		       struct rknpu_submit *args)
+ {
+-	return rknpu_submit(rknpu_dev, args);
++	/* opi5: the task buffer must be one of this client's imports. */
++	struct rknpu_mem_object *task_obj =
++		rknpu_mem_get(rknpu_dev, session, args->task_obj_addr);
++
++	if (!task_obj) {
++		LOG_ERROR("submit: task_obj_addr %#llx is not one of this client's buffers\n",
++			  (unsigned long long)args->task_obj_addr);
++		return -EINVAL;
++	}
++	return rknpu_submit(rknpu_dev, args, task_obj);
+ }
+ #endif
+ 
+diff --git a/drivers/rknpu/src/rknpu_mem.c b/drivers/rknpu/src/rknpu_mem.c
+index 677aa82bd858..109f46aac7e7 100644
+--- a/drivers/rknpu/src/rknpu_mem.c
++++ b/drivers/rknpu/src/rknpu_mem.c
+@@ -258,6 +258,7 @@
+ #include <linux/fs.h>
+ #include <linux/highmem.h>
+ #include <linux/iommu.h>
++#include <linux/kref.h>
+ #include <linux/mm.h>
+ #include <linux/scatterlist.h>
+ #include <linux/slab.h>
+@@ -320,6 +321,12 @@ struct rknpu_mem_buf {
+ 	struct page		**pages;	/* physical pages (both paths) */
+ 	unsigned long		 nr_pages;	/* number of pages (both paths) */
+ 	struct iosys_map	 vmap_map;	/* dma_buf_vmap map (import path) */
++	/*
++	 * opi5: one reference for the session list, one per lookup in
++	 * flight (MEM_SYNC) and one per job using it as its task buffer, so
++	 * MEM_DESTROY or close never frees a buffer still in use.
++	 */
++	struct kref		 ref;
+ };
+ 
+ /*
+@@ -429,6 +436,7 @@ static int rknpu_mem_import(struct rknpu_device *rknpu_dev,
+ 	 * crashed, or stopped by its container runtime).  Untracked, the
+ 	 * mapping and the dma-buf reference outlived the process.
+ 	 */
++	kref_init(&buf->ref);
+ 	spin_lock(&rknpu_dev->lock);
+ 	list_add_tail(&buf->mem.head, &session->list);
+ 	spin_unlock(&rknpu_dev->lock);
+@@ -460,10 +468,38 @@ static void rknpu_mem_import_release(struct rknpu_mem_buf *buf)
+ 	kfree(buf);
+ }
+ 
+-/* Free an import already taken off its session list. */
+-void rknpu_mem_import_free(struct rknpu_mem_object *obj)
++static void rknpu_mem_buf_release(struct kref *ref)
++{
++	rknpu_mem_import_release(container_of(ref, struct rknpu_mem_buf, ref));
++}
++
++/* Process context only: the last reference unmaps and puts the dma-buf. */
++void rknpu_mem_put(struct rknpu_mem_object *obj)
+ {
+-	rknpu_mem_import_release(container_of(obj, struct rknpu_mem_buf, mem));
++	kref_put(&container_of(obj, struct rknpu_mem_buf, mem)->ref,
++		 rknpu_mem_buf_release);
++}
++
++struct rknpu_mem_object *rknpu_mem_get(struct rknpu_device *rknpu_dev,
++				       struct rknpu_session *session,
++				       __u64 obj_addr)
++{
++	struct rknpu_mem_object *entry, *found = NULL;
++
++	if (!obj_addr || !session)
++		return NULL;
++
++	spin_lock(&rknpu_dev->lock);
++	list_for_each_entry(entry, &session->list, head) {
++		if ((__u64)(uintptr_t)entry == obj_addr) {
++			kref_get(&container_of(entry, struct rknpu_mem_buf, mem)->ref);
++			found = entry;
++			break;
++		}
++	}
++	spin_unlock(&rknpu_dev->lock);
++
++	return found;
+ }
+ 
+ static int rknpu_mem_obj_mmap(struct file *filp, struct vm_area_struct *vma)
+@@ -540,6 +576,19 @@ int rknpu_mem_create_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
+ 		return 0;
+ 	}
+ 
++	/*
++	 * opi5: refuse driver-allocated buffers.  librknnrt 2.3.2 in
++	 * DMA_HEAP mode imports every buffer; this path was never taken on
++	 * our boards.  It placed each buffer at a cursor in the NPU's 32-bit
++	 * IOVA space that never moved back (past 4 GB in total it overlapped
++	 * the DMA API's own mappings), took an unbounded size, and its
++	 * buffers weren't tracked per session.  The code below is kept
++	 * unreachable so the file stays comparable with mack42's.
++	 */
++	dev_warn_once(rknpu_dev->dev,
++		      "mem_create: driver-allocated buffers are disabled; import a dma-buf instead\n");
++	return -EOPNOTSUPP;
++
+ 	buf = kzalloc(sizeof(*buf), GFP_KERNEL);
+ 	if (!buf)
+ 		return -ENOMEM;
+@@ -837,24 +886,28 @@ int rknpu_mem_destroy_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
+ 	spin_unlock(&rknpu_dev->lock);
+ 
+ 	if (found)
+-		rknpu_mem_import_free(found);
++		rknpu_mem_put(found);
+ 
+ 	return 0;
+ }
+ 
+-int rknpu_mem_sync_ioctl(struct rknpu_device *rknpu_dev, unsigned long data)
++int rknpu_mem_sync_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
++			 unsigned long data)
+ {
+ 	struct rknpu_mem_sync args;
++	struct rknpu_mem_object *obj;
+ 	struct rknpu_mem_buf *buf;
+ 	unsigned long i;
+ 
+ 	if (copy_from_user(&args, (void __user *)data, sizeof(args)))
+ 		return -EFAULT;
+ 
+-	if (!args.obj_addr) {
++	/* opi5: never dereference a pointer from userspace. */
++	obj = rknpu_mem_get(rknpu_dev, file->private_data, args.obj_addr);
++	if (!obj) {
+ 		LOG_DEV_ERROR(rknpu_dev->dev,
+-			      "mem_sync: obj_addr=0 (flags=%#x offset=%llu size=%llu) -> EINVAL\n",
+-			      args.flags, args.offset, args.size);
++			      "mem_sync: obj_addr %#llx is not one of this client's buffers (flags=%#x offset=%llu size=%llu) -> EINVAL\n",
++			      args.obj_addr, args.flags, args.offset, args.size);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -863,7 +916,7 @@ int rknpu_mem_sync_ioctl(struct rknpu_device *rknpu_dev, unsigned long data)
+ 	 * mem is the first member of rknpu_mem_buf so the two pointers
+ 	 * are identical — no container_of offset arithmetic needed.
+ 	 */
+-	buf = (struct rknpu_mem_buf *)(uintptr_t)args.obj_addr;
++	buf = container_of(obj, struct rknpu_mem_buf, mem);
+ 
+ 	if (buf->mem.dmabuf) {
+ 		/*
+@@ -909,5 +962,6 @@ int rknpu_mem_sync_ioctl(struct rknpu_device *rknpu_dev, unsigned long data)
+ 					    buf->sgt.nents, DMA_FROM_DEVICE);
+ 	}
+ 
++	rknpu_mem_put(obj);
+ 	return 0;
+ }

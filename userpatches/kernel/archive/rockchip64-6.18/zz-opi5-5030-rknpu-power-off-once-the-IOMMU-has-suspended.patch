@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: opi5 <noreply@example.invalid>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH] rknpu: power off once the IOMMU has suspended
+
+rknpu_power_off() waits for the NPU's IOMMU to runtime-suspend before it
+gates the NPU clocks, because the IOMMU's suspend writes every MMU bank.
+The compat stub for rockchip_iommu_is_enabled() returned "the device has
+an IOMMU group", which is always true. So every power-off timed out after
+20 ms, logged "iommu still enabled" and took its power reference back:
+the NPU was never clock-gated, and the delayed power-off retried every
+3 s for as long as the module was loaded. Module removal and system
+suspend failed the same way.
+
+Look up the IOMMU's device and report whether it is runtime-active. Its
+idle check is only requested through the device link, on the freezable
+pm_wq, so run it synchronously first.
+---
+ .../compat/soc/rockchip/rockchip_iommu.h      | 43 ++++++++++++++++---
+ 1 file changed, 36 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/rknpu/src/include/compat/soc/rockchip/rockchip_iommu.h b/drivers/rknpu/src/include/compat/soc/rockchip/rockchip_iommu.h
+index 75510929c68c..e2154d8388ae 100644
+--- a/drivers/rknpu/src/include/compat/soc/rockchip/rockchip_iommu.h
++++ b/drivers/rknpu/src/include/compat/soc/rockchip/rockchip_iommu.h
+@@ -6,16 +6,45 @@
+ 
+ #include <linux/device.h>
+ #include <linux/iommu.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
+ 
++/* The IOMMU that translates for @dev, with a reference, or NULL. */
++static inline struct device *rknpu_compat_iommu_dev(struct device *dev)
++{
++	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
++
++	if (!fwspec || !fwspec->iommu_fwnode)
++		return NULL;
++	return bus_find_device_by_fwnode(&platform_bus_type, fwspec->iommu_fwnode);
++}
++
++/*
++ * Whether @dev's IOMMU is still runtime-active.  rknpu_power_off() waits for
++ * it to suspend before it gates the NPU's clocks: the IOMMU's runtime suspend
++ * writes every MMU bank, and the core1/core2 banks run on those clocks.
++ *
++ * opi5: this stub returned "@dev has an IOMMU group", which is always true,
++ * so every power-off timed out after 20 ms, logged "iommu still enabled" and
++ * took its power reference back.  The NPU was never clock-gated, and the
++ * delayed power-off retried every 3 s for as long as the module was loaded.
++ *
++ * The PM_RUNTIME device link only requests the IOMMU's idle check, on the
++ * freezable pm_wq, which does not run during system suspend.  Run it here,
++ * synchronously; it suspends the IOMMU once @dev has released it.
++ */
+ static inline bool rockchip_iommu_is_enabled(struct device *dev)
+ {
+-	/* If the device has an IOMMU group, IOMMU is enabled */
+-	struct iommu_group *group = iommu_group_get(dev);
+-	if (group) {
+-		iommu_group_put(group);
+-		return true;
+-	}
+-	return false;
++	struct device *iommu_dev = rknpu_compat_iommu_dev(dev);
++	bool enabled;
++
++	if (!iommu_dev)
++		return false;
++	if (!pm_runtime_status_suspended(iommu_dev))
++		pm_runtime_idle(iommu_dev);
++	enabled = !pm_runtime_status_suspended(iommu_dev);
++	put_device(iommu_dev);
++	return enabled;
+ }
+ 
+ static inline void rockchip_iommu_disable(struct device *dev)

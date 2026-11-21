@@ -1,0 +1,195 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: opi5 <noreply@example.invalid>
+Date: Mon, 10 Aug 2026 00:00:00 +0000
+Subject: [PATCH] media: rockchip: rga: fix for 6.18 DMA and IOMMU
+
+- fail partial get_user_pages() mappings
+- don't install a fault handler on the default IOMMU domain (6.18 WARNs)
+- add OF module tables for autoload
+- raise the max DMA segment size so user buffers map to one segment
+- reject user buffers that still map to more than one segment: the cores
+  take a single base address per plane
+- include rga3/include as $(src)/include: since 6.10 $(src) is the
+  source directory, so $(srctree)/$(src) breaks when it is absolute
+---
+ .../media/platform/rockchip/rga/rga3/Makefile |  2 +-
+ .../platform/rockchip/rga/rga3/rga_drv.c      | 26 +++++++++++++++
+ .../platform/rockchip/rga/rga3/rga_iommu.c    | 17 +++++++++-
+ .../media/platform/rockchip/rga/rga3/rga_mm.c | 33 ++++++++++++++++++-
+ 4 files changed, 75 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/rga/rga3/Makefile b/drivers/media/platform/rockchip/rga/rga3/Makefile
+index 11f401de2ae0..ccc68c7990dd 100644
+--- a/drivers/media/platform/rockchip/rga/rga3/Makefile
++++ b/drivers/media/platform/rockchip/rga/rga3/Makefile
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: GPL-2.0
+ 
+-ccflags-y += -I$(srctree)/$(src)/include
++ccflags-y += -I$(src)/include
+ 
+ rga3-y	:= rga_drv.o rga_common.o rga3_reg_info.o rga_iommu.o rga_dma_buf.o rga_job.o rga_hw_config.o rga2_reg_info.o rga_policy.o rga_mm.o
+ rga3-$(CONFIG_ROCKCHIP_RGA_ASYNC) += rga_fence.o
+diff --git a/drivers/media/platform/rockchip/rga/rga3/rga_drv.c b/drivers/media/platform/rockchip/rga/rga3/rga_drv.c
+index 514fd5fd821a..cfcf8ecb0e84 100644
+--- a/drivers/media/platform/rockchip/rga/rga3/rga_drv.c
++++ b/drivers/media/platform/rockchip/rga/rga3/rga_drv.c
+@@ -1277,6 +1277,8 @@ static const struct of_device_id rga3_dt_ids[] = {
+ 	{},
+ };
+ 
++MODULE_DEVICE_TABLE(of, rga3_dt_ids);
++
+ static const struct of_device_id rga2_dt_ids[] = {
+ 	{
+ 	 .compatible = "rockchip,rga2",
+@@ -1289,6 +1291,7 @@ static const struct of_device_id rga2_dt_ids[] = {
+ 	},
+ 	{},
+ };
++MODULE_DEVICE_TABLE(of, rga2_dt_ids);
+ 
+ static int init_scheduler(struct rga_scheduler_t *scheduler,
+ 			  struct device *dev,
+@@ -1332,6 +1335,29 @@ static int init_scheduler(struct rga_scheduler_t *scheduler,
+ 	scheduler->ops = match_data->ops;
+ 	scheduler->dev = dev;
+ 
++	/*
++	 * rga_dma_map_sgt()/rga_mm_map_virt_addr() record only the first
++	 * scatter-gather segment's IOVA (sg_dma_address(sgt->sgl)) and then
++	 * treat the whole external buffer as one flat, contiguous IOVA range
++	 * when programming hardware addresses. dma_map_sg() on an IOMMU-backed
++	 * device only merges scattered physical pages into a single DMA
++	 * segment up to dma_get_max_seg_size(dev), which defaults to 64KiB
++	 * when dma_parms is unset. Any user virtual-address buffer whose
++	 * physical pages don't coalesce within that default gets silently
++	 * split into multiple, not-necessarily-adjacent IOVA segments, so
++	 * bytes past the first segment land on the wrong (or unmapped) IOVA
++	 * and the core's internal MMU/TLB faults (m_RGA3_INT_RGA_MMU_INTR /
++	 * m_RGA2_INT_RGA_MMU_INTR) mid-job. Raise the cap so the whole
++	 * request is merged into one segment, matching what
++	 * rga_dma_map_sgt() already assumes.
++	 */
++	if (!dev->dma_parms)
++		dev->dma_parms = devm_kzalloc(dev, sizeof(*dev->dma_parms), GFP_KERNEL);
++	if (dev->dma_parms)
++		dma_set_max_seg_size(dev, UINT_MAX);
++	else
++		dev_warn(dev, "failed to allocate dma_parms; virt-addr buffers over 64KiB may fault\n");
++
+ 	spin_lock_init(&scheduler->irq_lock);
+ 	INIT_LIST_HEAD(&scheduler->todo_list);
+ 	init_waitqueue_head(&scheduler->job_done_wq);
+diff --git a/drivers/media/platform/rockchip/rga/rga3/rga_iommu.c b/drivers/media/platform/rockchip/rga/rga3/rga_iommu.c
+index 4a3223e835cb..57336de45c7d 100644
+--- a/drivers/media/platform/rockchip/rga/rga3/rga_iommu.c
++++ b/drivers/media/platform/rockchip/rga/rga3/rga_iommu.c
+@@ -219,7 +219,8 @@ void rga_mmu_base_free(struct rga_mmu_base **mmu_base)
+ 	*mmu_base = NULL;
+ }
+ 
+-static int rga_iommu_intr_fault_handler(struct iommu_domain *iommu, struct device *iommu_dev,
++static int __maybe_unused rga_iommu_intr_fault_handler(struct iommu_domain *iommu,
++					struct device *iommu_dev,
+ 					unsigned long iova, int status, void *arg)
+ {
+ 	struct rga_scheduler_t *scheduler = (struct rga_scheduler_t *)arg;
+@@ -336,9 +337,23 @@ int rga_iommu_bind(void)
+ 			if (main_iommu == NULL) {
+ 				main_iommu = scheduler->iommu_info;
+ 				main_iommu_index = i;
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0)
+ 				iommu_set_fault_handler(main_iommu->domain,
+ 							rga_iommu_intr_fault_handler,
+ 							(void *)scheduler);
++#else
++				/*
++				 * On 6.18+, the default domain already carries
++				 * a non-NONE cookie_type by the time this probe
++				 * path runs, so iommu_set_fault_handler() only
++				 * WARN_ON()s and silently declines to install
++				 * the handler (drivers/iommu/iommu.c). Calling
++				 * it is a harmless no-op wart, not a functional
++				 * requirement, so skip it here to avoid the
++				 * boot-time WARN backtrace. rga_iommu_intr_fault_handler
++				 * is not invoked on this kernel either way.
++				 */
++#endif
+ 			} else {
+ 				scheduler->iommu_info->domain = main_iommu->domain;
+ 				scheduler->iommu_info->default_dev = main_iommu->default_dev;
+diff --git a/drivers/media/platform/rockchip/rga/rga3/rga_mm.c b/drivers/media/platform/rockchip/rga/rga3/rga_mm.c
+index c497ec3d5192..7ddac12013b9 100644
+--- a/drivers/media/platform/rockchip/rga/rga3/rga_mm.c
++++ b/drivers/media/platform/rockchip/rga/rga3/rga_mm.c
+@@ -32,6 +32,7 @@ static void rga_current_mm_read_unlock(struct mm_struct *mm)
+ #endif
+ }
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0)
+ static int rga_get_user_pages_from_vma(struct page **pages, unsigned long Memory,
+ 				       uint32_t pageCount, struct mm_struct *current_mm)
+ {
+@@ -110,6 +111,7 @@ static int rga_get_user_pages_from_vma(struct page **pages, unsigned long Memory
+ 
+ 	return ret;
+ }
++#endif
+ 
+ static int rga_get_user_pages(struct page **pages, unsigned long Memory,
+ 			      uint32_t pageCount, int writeFlag,
+@@ -148,7 +150,11 @@ static int rga_get_user_pages(struct page **pages, unsigned long Memory,
+ 			for (i = 0; i < result; i++)
+ 				put_page(pages[i]);
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
++		ret = result < 0 ? result : -EFAULT;
++#else
+ 		ret = rga_get_user_pages_from_vma(pages, Memory, pageCount, current_mm);
++#endif
+ 		if (ret < 0 && result > 0) {
+ 			rga_err("Only get buffer %d byte from user pages, but current image required %d byte\n",
+ 				(int)(result * PAGE_SIZE), (int)(pageCount * PAGE_SIZE));
+@@ -618,8 +624,31 @@ static int rga_mm_map_virt_addr(struct rga_external_buffer *external_buffer,
+ 		goto free_dma_buffer;
+ 	}
+ 
+-	if (scheduler->data->mmu == RGA_IOMMU)
++	if (scheduler->data->mmu == RGA_IOMMU) {
++		/*
++		 * RGA3/RGA2 IOMMU-type cores program exactly one base address
++		 * per plane; they have no per-job scatter-gather descriptor.
++		 * rga_dma_map_sgt() can still return more than one DMA segment
++		 * for a user virtual-address buffer whose physical pages this
++		 * IOMMU backend did not coalesce into a single IOVA run (seen
++		 * even with an unbounded dma_max_seg_size for buffers with
++		 * enough physical scatter). Treating buffer->dma_addr as the
++		 * base of the whole buffer would then be wrong for any byte
++		 * past the first segment, and the core's internal MMU/TLB
++		 * faults on the resulting bad address mid-job, forcing a
++		 * hardware reset. Reject in software instead of letting that
++		 * reach hardware.
++		 */
++		if (sgt->nents > 1) {
++			rga_err("%s core[%d] rejecting virt-addr buffer va = 0x%lx: dma_map_sg produced %d non-mergeable segments (orig_nents = %d), cannot be given one hardware base address\n",
++				__func__, scheduler->core,
++				(unsigned long)virt_addr->addr, sgt->nents, sgt->orig_nents);
++			ret = -EOPNOTSUPP;
++			goto unmap_dma_buffer;
++		}
++
+ 		buffer->iova = buffer->dma_addr;
++	}
+ 
+ 	internal_buffer->virt_addr = virt_addr;
+ 	internal_buffer->dma_buffer = buffer;
+@@ -630,6 +659,8 @@ static int rga_mm_map_virt_addr(struct rga_external_buffer *external_buffer,
+ 
+ 	return 0;
+ 
++unmap_dma_buffer:
++	rga_dma_unmap_sgt(buffer);
+ free_dma_buffer:
+ 	kfree(buffer);
+ free_sgt:

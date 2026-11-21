@@ -1,0 +1,111 @@
+# A tag v<kernel>-<revision> (e.g. v6.18.63-1) also publishes a release.
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+
+env:
+  MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+  # A host path, not a volume, so actions/cache can keep ccache.
+  OPI5_ARMBIAN_VOLUME: ${{ github.workspace }}/work/armbian
+  KERNEL_GIT: shallow
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check the tag against the kernel pin
+        if: github.ref_type == 'tag'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          kernel=$(sed -n 's/^declare -g KERNELBRANCH=tag:v//p' userpatches/config-opi5.conf)
+          if [[ -z $kernel || $TAG != "v$kernel-"* || ! ${TAG#"v$kernel-"} =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::tag $TAG doesn't match the pinned kernel: expected v${kernel:-?}-<n>"
+            exit 1
+          fi
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Cache ccache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: work/armbian/cache/ccache
+          key: ccache-${{ github.run_id }}
+          restore-keys: ccache-
+
+      # Armbian runs make under `env -i`, so the limit goes in ccache.conf.
+      - name: Limit ccache
+        run: |
+          mkdir -p work/armbian/cache/ccache
+          echo "max_size = 3G" > work/armbian/cache/ccache/ccache.conf
+
+      - uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
+
+      - name: Build
+        run: mise run build -- SHOW_CCACHE=yes
+
+      # Written as root in the container; actions/cache saves it as the runner.
+      - name: Own ccache
+        if: always()
+        run: |
+          if [[ -d work/armbian/cache/ccache ]]; then
+            sudo chown -R "$(id -u):$(id -g)" work/armbian/cache/ccache
+          fi
+
+      # Boots the package's kernel in QEMU; the logs go into the uploaded out/kunit/.
+      - name: KUnit
+        run: mise run kunit
+
+      - name: Add the userpatches tarball
+        env:
+          NAME: opi5-userpatches-${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+        run: |
+          tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@"$(git log -1 --format=%ct)" \
+            -czf "out/$NAME.tar.gz" userpatches
+          (cd out && sha256sum linux-*.deb opi5-userpatches-*.tar.gz > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: opi5-kernel
+          path: out/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: opi5-kernel
+          path: out
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd out
+          sha256sum --check SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Armbian current kernel for the Orange Pi 5 Pro with the MPP/RGA and RKNPU drivers. Install the three .deb files, or extract opi5-userpatches-*.tar.gz into an armbian/build checkout and run ./compile.sh opi5 kernel." \
+            linux-*.deb opi5-userpatches-*.tar.gz SHA256SUMS

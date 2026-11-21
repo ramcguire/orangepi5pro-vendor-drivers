@@ -1,0 +1,5229 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: opi5 <noreply@example.invalid>
+Date: Sat, 8 Aug 2026 00:00:00 +0000
+Subject: [PATCH] media: rockchip: add vendor MPP service
+
+The MPP service (rk_vcodec.ko): sessions, ioctls, dma-buf, IOMMU. Changed
+from the vendor code:
+- no dma-buf-cache header (optional; plain dma-buf references are used)
+- MPP_VERSION is fixed instead of read from git at build time
+- runtime PM instead of the private PMU idle hint
+- IOMMU refresh reattaches the generic domain
+
+Origin: https://github.com/rockchip-linux/kernel b4ef083dc0c3 (develop-6.1)
+---
+ drivers/media/platform/rockchip/mpp/Kconfig   |   21 +
+ drivers/media/platform/rockchip/mpp/Makefile  |    7 +
+ .../media/platform/rockchip/mpp/mpp_common.c  | 2694 +++++++++++++++++
+ .../media/platform/rockchip/mpp/mpp_common.h  |  877 ++++++
+ .../media/platform/rockchip/mpp/mpp_debug.h   |  138 +
+ .../media/platform/rockchip/mpp/mpp_iommu.c   |  672 ++++
+ .../media/platform/rockchip/mpp/mpp_iommu.h   |  189 ++
+ .../media/platform/rockchip/mpp/mpp_service.c |  551 ++++
+ 8 files changed, 5149 insertions(+)
+ create mode 100644 drivers/media/platform/rockchip/mpp/Kconfig
+ create mode 100644 drivers/media/platform/rockchip/mpp/Makefile
+ create mode 100644 drivers/media/platform/rockchip/mpp/mpp_common.c
+ create mode 100644 drivers/media/platform/rockchip/mpp/mpp_common.h
+ create mode 100644 drivers/media/platform/rockchip/mpp/mpp_debug.h
+ create mode 100644 drivers/media/platform/rockchip/mpp/mpp_iommu.c
+ create mode 100644 drivers/media/platform/rockchip/mpp/mpp_iommu.h
+ create mode 100644 drivers/media/platform/rockchip/mpp/mpp_service.c
+
+diff --git a/drivers/media/platform/rockchip/mpp/Kconfig b/drivers/media/platform/rockchip/mpp/Kconfig
+new file mode 100644
+index 000000000000..dd4145803229
+--- /dev/null
++++ b/drivers/media/platform/rockchip/mpp/Kconfig
+@@ -0,0 +1,21 @@
++# SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++
++menuconfig ROCKCHIP_MPP_SERVICE
++	tristate "Rockchip MPP service framework"
++	depends on ARCH_ROCKCHIP && IOMMU_SUPPORT
++	select DMA_SHARED_BUFFER
++	help
++	  Build the shared Rockchip MPP session, DMA-buffer, and IOMMU service.
++	  This base alone exposes no codec hardware. Select a reviewed MPP codec
++	  driver only in an isolated profile that owns its device-tree nodes.
++
++if ROCKCHIP_MPP_SERVICE
++
++config ROCKCHIP_MPP_PROC_FS
++	bool "MPP service procfs diagnostics"
++	depends on PROC_FS
++	default y
++	help
++	  Expose read-only MPP service diagnostics in procfs.
++
++endif
+diff --git a/drivers/media/platform/rockchip/mpp/Makefile b/drivers/media/platform/rockchip/mpp/Makefile
+new file mode 100644
+index 000000000000..5fa3a26e046a
+--- /dev/null
++++ b/drivers/media/platform/rockchip/mpp/Makefile
+@@ -0,0 +1,7 @@
++# SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++
++# Kept deterministic: the MPP ioctl ABI must not depend on a build worktree.
++ccflags-y += -DMPP_VERSION=\"b4ef083dc0c3608e744deabb43dc6b781aadbe6e\"
++
++rk_vcodec-y := mpp_service.o mpp_common.o mpp_iommu.o
++obj-$(CONFIG_ROCKCHIP_MPP_SERVICE) += rk_vcodec.o
+diff --git a/drivers/media/platform/rockchip/mpp/mpp_common.c b/drivers/media/platform/rockchip/mpp/mpp_common.c
+new file mode 100644
+index 000000000000..18c4343573a1
+--- /dev/null
++++ b/drivers/media/platform/rockchip/mpp/mpp_common.c
+@@ -0,0 +1,2694 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++/*
++ * Copyright (c) 2019 Fuzhou Rockchip Electronics Co., Ltd
++ *
++ * author:
++ *	Alpha Lin, alpha.lin@rock-chips.com
++ *	Randy Li, randy.li@rock-chips.com
++ *	Ding Wei, leo.ding@rock-chips.com
++ *
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/file.h>
++#include <linux/interrupt.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/of_irq.h>
++#include <linux/proc_fs.h>
++#include <linux/pm_runtime.h>
++#include <linux/poll.h>
++#include <linux/regmap.h>
++#include <linux/rwsem.h>
++#include <linux/mfd/syscon.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++#include <linux/nospec.h>
++
++#include <soc/rockchip/pm_domains.h>
++
++#include "mpp_debug.h"
++#include "mpp_common.h"
++#include "mpp_iommu.h"
++
++/* input parmater structure for version 1 */
++struct mpp_msg_v1 {
++	__u32 cmd;
++	__u32 flags;
++	__u32 size;
++	__u32 offset;
++	__u64 data_ptr;
++};
++
++#ifdef CONFIG_ROCKCHIP_MPP_PROC_FS
++const char *mpp_device_name[MPP_DEVICE_BUTT] = {
++	[MPP_DEVICE_VDPU1]		= "VDPU1",
++	[MPP_DEVICE_VDPU2]		= "VDPU2",
++	[MPP_DEVICE_VDPU1_PP]		= "VDPU1_PP",
++	[MPP_DEVICE_VDPU2_PP]		= "VDPU2_PP",
++	[MPP_DEVICE_AV1DEC]		= "AV1DEC",
++	[MPP_DEVICE_HEVC_DEC]		= "HEVC_DEC",
++	[MPP_DEVICE_RKVDEC]		= "RKVDEC",
++	[MPP_DEVICE_AVSPLUS_DEC]	= "AVSPLUS_DEC",
++	[MPP_DEVICE_RKJPEGD]		= "RKJPEGD",
++	[MPP_DEVICE_RKVENC]		= "RKVENC",
++	[MPP_DEVICE_VEPU1]		= "VEPU1",
++	[MPP_DEVICE_VEPU2]		= "VEPU2",
++	[MPP_DEVICE_VEPU2_JPEG]		= "VEPU2",
++	[MPP_DEVICE_RKJPEGE]		= "RKJPEGE",
++	[MPP_DEVICE_VEPU22]		= "VEPU22",
++	[MPP_DEVICE_IEP2]		= "IEP2",
++	[MPP_DEVICE_VDPP]		= "VDPP",
++};
++
++const char *enc_info_item_name[ENC_INFO_BUTT] = {
++	[ENC_INFO_BASE]		= "null",
++	[ENC_INFO_WIDTH]	= "width",
++	[ENC_INFO_HEIGHT]	= "height",
++	[ENC_INFO_FORMAT]	= "format",
++	[ENC_INFO_FPS_IN]	= "fps_in",
++	[ENC_INFO_FPS_OUT]	= "fps_out",
++	[ENC_INFO_RC_MODE]	= "rc_mode",
++	[ENC_INFO_BITRATE]	= "bitrate",
++	[ENC_INFO_GOP_SIZE]	= "gop_size",
++	[ENC_INFO_FPS_CALC]	= "fps_calc",
++	[ENC_INFO_PROFILE]	= "profile",
++};
++
++#endif
++
++static void mpp_attach_workqueue(struct mpp_dev *mpp,
++				 struct mpp_taskqueue *queue);
++
++static int
++mpp_taskqueue_pop_pending(struct mpp_taskqueue *queue,
++			  struct mpp_task *task)
++{
++	if (!task->session || !task->session->mpp)
++		return -EINVAL;
++
++	mutex_lock(&queue->pending_lock);
++	list_del_init(&task->queue_link);
++	mutex_unlock(&queue->pending_lock);
++	kref_put(&task->ref, mpp_free_task);
++
++	return 0;
++}
++
++static struct mpp_task *
++mpp_taskqueue_get_pending_task(struct mpp_taskqueue *queue)
++{
++	struct mpp_task *task = NULL;
++
++	mutex_lock(&queue->pending_lock);
++	task = list_first_entry_or_null(&queue->pending_list,
++					struct mpp_task,
++					queue_link);
++	mutex_unlock(&queue->pending_lock);
++
++	return task;
++}
++
++static bool
++mpp_taskqueue_is_running(struct mpp_taskqueue *queue)
++{
++	unsigned long flags;
++	bool flag;
++
++	spin_lock_irqsave(&queue->running_lock, flags);
++	flag = !list_empty(&queue->running_list);
++	spin_unlock_irqrestore(&queue->running_lock, flags);
++
++	return flag;
++}
++
++int mpp_taskqueue_pending_to_run(struct mpp_taskqueue *queue, struct mpp_task *task)
++{
++	unsigned long flags;
++
++	mutex_lock(&queue->pending_lock);
++	spin_lock_irqsave(&queue->running_lock, flags);
++	list_move_tail(&task->queue_link, &queue->running_list);
++	spin_unlock_irqrestore(&queue->running_lock, flags);
++
++	mutex_unlock(&queue->pending_lock);
++
++	return 0;
++}
++
++static struct mpp_task *
++mpp_taskqueue_get_running_task(struct mpp_taskqueue *queue)
++{
++	unsigned long flags;
++	struct mpp_task *task = NULL;
++
++	spin_lock_irqsave(&queue->running_lock, flags);
++	task = list_first_entry_or_null(&queue->running_list,
++					struct mpp_task,
++					queue_link);
++	spin_unlock_irqrestore(&queue->running_lock, flags);
++
++	return task;
++}
++
++static int
++mpp_taskqueue_pop_running(struct mpp_taskqueue *queue,
++			  struct mpp_task *task)
++{
++	unsigned long flags;
++
++	if (!task->session || !task->session->mpp)
++		return -EINVAL;
++
++	spin_lock_irqsave(&queue->running_lock, flags);
++	list_del_init(&task->queue_link);
++	spin_unlock_irqrestore(&queue->running_lock, flags);
++	kref_put(&task->ref, mpp_free_task);
++
++	return 0;
++}
++
++static void
++mpp_taskqueue_trigger_work(struct mpp_dev *mpp)
++{
++	kthread_queue_work(&mpp->queue->worker, &mpp->work);
++}
++
++int mpp_power_on(struct mpp_dev *mpp)
++{
++	pm_runtime_get_sync(mpp->dev);
++	pm_stay_awake(mpp->dev);
++
++	if (mpp->hw_ops->clk_on)
++		mpp->hw_ops->clk_on(mpp);
++
++	return 0;
++}
++
++int mpp_power_off(struct mpp_dev *mpp)
++{
++	if (mpp->hw_ops->clk_off)
++		mpp->hw_ops->clk_off(mpp);
++
++	pm_relax(mpp->dev);
++	if (mpp_taskqueue_get_pending_task(mpp->queue) ||
++	    mpp_taskqueue_get_running_task(mpp->queue)) {
++		pm_runtime_mark_last_busy(mpp->dev);
++		pm_runtime_put_autosuspend(mpp->dev);
++	} else {
++		pm_runtime_put_sync_suspend(mpp->dev);
++	}
++
++	return 0;
++}
++
++static void task_msgs_reset(struct mpp_task_msgs *msgs)
++{
++	list_del_init(&msgs->list);
++
++	msgs->flags = 0;
++	msgs->req_cnt = 0;
++	msgs->set_cnt = 0;
++	msgs->poll_cnt = 0;
++}
++
++static void task_msgs_init(struct mpp_task_msgs *msgs, struct mpp_session *session)
++{
++	INIT_LIST_HEAD(&msgs->list);
++
++	msgs->session = session;
++	msgs->queue = NULL;
++	msgs->task = NULL;
++	msgs->mpp = NULL;
++
++	msgs->ext_fd = -1;
++
++	task_msgs_reset(msgs);
++}
++
++static struct mpp_task_msgs *get_task_msgs(struct mpp_session *session)
++{
++	unsigned long flags;
++	struct mpp_task_msgs *msgs;
++
++	spin_lock_irqsave(&session->lock_msgs, flags);
++	msgs = list_first_entry_or_null(&session->list_msgs_idle,
++					struct mpp_task_msgs, list_session);
++	if (msgs) {
++		list_move_tail(&msgs->list_session, &session->list_msgs);
++		spin_unlock_irqrestore(&session->lock_msgs, flags);
++
++		return msgs;
++	}
++	spin_unlock_irqrestore(&session->lock_msgs, flags);
++
++	msgs = kzalloc(sizeof(*msgs), GFP_KERNEL);
++	task_msgs_init(msgs, session);
++	INIT_LIST_HEAD(&msgs->list_session);
++
++	spin_lock_irqsave(&session->lock_msgs, flags);
++	list_move_tail(&msgs->list_session, &session->list_msgs);
++	session->msgs_cnt++;
++	spin_unlock_irqrestore(&session->lock_msgs, flags);
++
++	mpp_debug_func(DEBUG_TASK_INFO, "session %d:%d msgs cnt %d\n",
++		       session->pid, session->index, session->msgs_cnt);
++
++	return msgs;
++}
++
++static void put_task_msgs(struct mpp_task_msgs *msgs)
++{
++	struct mpp_session *session = msgs->session;
++	unsigned long flags;
++
++	if (!session) {
++		pr_err("invalid msgs without session\n");
++		return;
++	}
++
++	if (msgs->ext_fd >= 0) {
++		fdput(msgs->f);
++		msgs->ext_fd = -1;
++	}
++
++	task_msgs_reset(msgs);
++
++	spin_lock_irqsave(&session->lock_msgs, flags);
++	list_move_tail(&msgs->list_session, &session->list_msgs_idle);
++	spin_unlock_irqrestore(&session->lock_msgs, flags);
++}
++
++static void clear_task_msgs(struct mpp_session *session)
++{
++	struct mpp_task_msgs *msgs, *n;
++	LIST_HEAD(list_to_free);
++	unsigned long flags;
++
++	spin_lock_irqsave(&session->lock_msgs, flags);
++
++	list_for_each_entry_safe(msgs, n, &session->list_msgs, list_session)
++		list_move_tail(&msgs->list_session, &list_to_free);
++
++	list_for_each_entry_safe(msgs, n, &session->list_msgs_idle, list_session)
++		list_move_tail(&msgs->list_session, &list_to_free);
++
++	spin_unlock_irqrestore(&session->lock_msgs, flags);
++
++	list_for_each_entry_safe(msgs, n, &list_to_free, list_session)
++		kfree(msgs);
++}
++
++static void mpp_session_clear_pending(struct mpp_session *session)
++{
++	struct mpp_task *task = NULL, *n;
++
++	/* clear session pending list */
++	mutex_lock(&session->pending_lock);
++	list_for_each_entry_safe(task, n,
++				 &session->pending_list,
++				 pending_link) {
++		/* abort task in taskqueue */
++		atomic_inc(&task->abort_request);
++		list_del_init(&task->pending_link);
++		kref_put(&task->ref, mpp_free_task);
++	}
++	mutex_unlock(&session->pending_lock);
++}
++
++void mpp_session_cleanup_detach(struct mpp_taskqueue *queue, struct kthread_work *work)
++{
++	struct mpp_session *session, *n;
++
++	if (!atomic_read(&queue->detach_count))
++		return;
++
++	mutex_lock(&queue->session_lock);
++	list_for_each_entry_safe(session, n, &queue->session_detach, session_link) {
++		s32 task_count = atomic_read(&session->task_count);
++
++		if (!task_count) {
++			list_del_init(&session->session_link);
++			atomic_dec(&queue->detach_count);
++		}
++
++		mutex_unlock(&queue->session_lock);
++
++		if (task_count) {
++			mpp_dbg_session("session %d:%d not finished %d task cnt %d\n",
++					session->device_type, session->index,
++					atomic_read(&queue->detach_count), task_count);
++
++			mpp_session_clear_pending(session);
++		} else {
++			mpp_dbg_session("queue detach %d\n",
++					atomic_read(&queue->detach_count));
++
++			mpp_session_deinit(session);
++		}
++
++		mutex_lock(&queue->session_lock);
++	}
++	mutex_unlock(&queue->session_lock);
++
++	if (atomic_read(&queue->detach_count)) {
++		mpp_dbg_session("queue detach %d again\n",
++				atomic_read(&queue->detach_count));
++
++		kthread_queue_work(&queue->worker, work);
++	}
++}
++
++static struct mpp_session *mpp_session_init(void)
++{
++	struct mpp_session *session = kzalloc(sizeof(*session), GFP_KERNEL);
++
++	if (!session)
++		return NULL;
++
++	session->pid = current->pid;
++
++	mutex_init(&session->pending_lock);
++	INIT_LIST_HEAD(&session->pending_list);
++	INIT_LIST_HEAD(&session->service_link);
++	INIT_LIST_HEAD(&session->session_link);
++
++	atomic_set(&session->task_count, 0);
++	atomic_set(&session->release_request, 0);
++
++	INIT_LIST_HEAD(&session->list_msgs);
++	INIT_LIST_HEAD(&session->list_msgs_idle);
++	spin_lock_init(&session->lock_msgs);
++
++	mpp_dbg_session("session %p init\n", session);
++	return session;
++}
++
++static void mpp_session_deinit_default(struct mpp_session *session)
++{
++	if (session->mpp) {
++		struct mpp_dev *mpp = session->mpp;
++
++		if (mpp->dev_ops->free_session)
++			mpp->dev_ops->free_session(session);
++
++		mpp_session_clear_pending(session);
++
++		if (session->dma) {
++			mpp_iommu_down_read(mpp->iommu_info);
++			mpp_dma_session_destroy(session->dma);
++			mpp_iommu_up_read(mpp->iommu_info);
++			session->dma = NULL;
++		}
++	}
++
++	if (session->srv) {
++		struct mpp_service *srv = session->srv;
++
++		mutex_lock(&srv->session_lock);
++		list_del_init(&session->service_link);
++		mutex_unlock(&srv->session_lock);
++	}
++
++	list_del_init(&session->session_link);
++}
++
++void mpp_session_deinit(struct mpp_session *session)
++{
++	mpp_dbg_session("session %d:%d task %d deinit\n", session->pid,
++			session->index, atomic_read(&session->task_count));
++
++	if (likely(session->deinit))
++		session->deinit(session);
++	else
++		pr_err("invalid NULL session deinit function\n");
++
++	clear_task_msgs(session);
++
++	kfree(session);
++}
++
++static void mpp_session_attach_workqueue(struct mpp_session *session,
++					 struct mpp_taskqueue *queue)
++{
++	mpp_dbg_session("session %d:%d attach\n", session->pid, session->index);
++	mutex_lock(&queue->session_lock);
++	list_add_tail(&session->session_link, &queue->session_attach);
++	mutex_unlock(&queue->session_lock);
++}
++
++static void mpp_session_detach_workqueue(struct mpp_session *session)
++{
++	struct mpp_taskqueue *queue;
++	struct mpp_dev *mpp;
++
++	if (!session->mpp || !session->mpp->queue)
++		return;
++
++	mpp_dbg_session("session %d:%d detach\n", session->pid, session->index);
++	mpp = session->mpp;
++	queue = mpp->queue;
++
++	mutex_lock(&queue->session_lock);
++	list_del_init(&session->session_link);
++	list_add_tail(&session->session_link, &queue->session_detach);
++	atomic_inc(&queue->detach_count);
++	mutex_unlock(&queue->session_lock);
++
++	mpp_taskqueue_trigger_work(mpp);
++}
++
++static int
++mpp_session_push_pending(struct mpp_session *session,
++			 struct mpp_task *task)
++{
++	kref_get(&task->ref);
++	mutex_lock(&session->pending_lock);
++	if (session->srv->timing_en) {
++		task->on_pending = ktime_get();
++		set_bit(TASK_TIMING_PENDING, &task->state);
++	}
++	list_add_tail(&task->pending_link, &session->pending_list);
++	mutex_unlock(&session->pending_lock);
++
++	return 0;
++}
++
++static int
++mpp_session_pop_pending(struct mpp_session *session,
++			struct mpp_task *task)
++{
++	mutex_lock(&session->pending_lock);
++	list_del_init(&task->pending_link);
++	mutex_unlock(&session->pending_lock);
++	kref_put(&task->ref, mpp_free_task);
++
++	return 0;
++}
++
++static struct mpp_task *
++mpp_session_get_pending_task(struct mpp_session *session)
++{
++	struct mpp_task *task = NULL;
++
++	mutex_lock(&session->pending_lock);
++	task = list_first_entry_or_null(&session->pending_list,
++					struct mpp_task,
++					pending_link);
++	mutex_unlock(&session->pending_lock);
++
++	return task;
++}
++
++void mpp_free_task(struct kref *ref)
++{
++	struct mpp_dev *mpp;
++	struct mpp_session *session;
++	struct mpp_task *task = container_of(ref, struct mpp_task, ref);
++
++	if (!task->session) {
++		mpp_err("task %p, task->session is null.\n", task);
++		return;
++	}
++	session = task->session;
++
++	mpp_debug_func(DEBUG_TASK_INFO, "session %d:%d task %d state 0x%lx abort %d\n",
++		       session->device_type, session->index, task->task_index,
++		       task->state, atomic_read(&task->abort_request));
++
++	mpp = mpp_get_task_used_device(task, session);
++	if (mpp->dev_ops->free_task)
++		mpp->dev_ops->free_task(session, task);
++
++	/* Decrease reference count */
++	atomic_dec(&session->task_count);
++	atomic_dec(&mpp->task_count);
++}
++
++static void mpp_task_timeout_work(struct work_struct *work_s)
++{
++	struct mpp_task *task = container_of(to_delayed_work(work_s),
++					     struct mpp_task,
++					     timeout_work);
++	struct mpp_dev *mpp;
++	struct mpp_session *session = task->session;
++
++	if (!session) {
++		mpp_err("task %p, task->session is null.\n", task);
++		return;
++	}
++
++	mpp = mpp_get_task_used_device(task, session);
++	if (!mpp) {
++		mpp_err("session %d:%d mpp is null\n", session->device_type, session->index);
++		return;
++	}
++	disable_irq(mpp->irq);
++	if (test_and_set_bit(TASK_STATE_HANDLE, &task->state)) {
++		mpp_err("session %d:%d task %d has been handled\n",
++			session->device_type, session->index, task->task_index);
++		enable_irq(mpp->irq);
++		return;
++	}
++	mpp_err("session %d:%d task %d processing time out!\n",
++		session->device_type, session->index, task->task_index);
++
++	mpp_task_dump_timing(task, ktime_us_delta(ktime_get(), task->on_create));
++	set_bit(TASK_STATE_TIMEOUT, &task->state);
++
++	enable_irq(mpp->irq);
++	mpp_taskqueue_trigger_work(mpp);
++}
++
++static int mpp_process_task_default(struct mpp_session *session,
++				    struct mpp_task_msgs *msgs)
++{
++	struct mpp_task *task = NULL;
++	struct mpp_dev *mpp = session->mpp;
++	u32 timing_en;
++	ktime_t on_create;
++
++	if (unlikely(!mpp)) {
++		mpp_err("pid %d client %d found invalid process function\n",
++			session->pid, session->device_type);
++		return -EINVAL;
++	}
++
++	timing_en = session->srv->timing_en;
++	if (timing_en)
++		on_create = ktime_get();
++
++	if (mpp->dev_ops->alloc_task)
++		task = mpp->dev_ops->alloc_task(session, msgs);
++	if (!task) {
++		mpp_err("alloc_task failed.\n");
++		return -ENOMEM;
++	}
++
++	if (timing_en) {
++		task->on_create_end = ktime_get();
++		task->on_create = on_create;
++		set_bit(TASK_TIMING_CREATE_END, &task->state);
++		set_bit(TASK_TIMING_CREATE, &task->state);
++	}
++
++	/* ensure current device */
++	mpp = mpp_get_task_used_device(task, session);
++
++	kref_init(&task->ref);
++	init_waitqueue_head(&task->wait);
++	atomic_set(&task->abort_request, 0);
++	task->task_index = atomic_fetch_inc(&mpp->task_index);
++	task->task_id = atomic_fetch_inc(&mpp->queue->task_id);
++	INIT_DELAYED_WORK(&task->timeout_work, mpp_task_timeout_work);
++
++	if (mpp->auto_freq_en && mpp->hw_ops->get_freq)
++		mpp->hw_ops->get_freq(mpp, task);
++
++	msgs->queue = mpp->queue;
++	msgs->task = task;
++	msgs->mpp = mpp;
++
++	/*
++	 * Push task to session should be in front of push task to queue.
++	 * Otherwise, when mpp_task_finish finish and worker_thread call
++	 * task worker, it may be get a task who has push in queue but
++	 * not in session, cause some errors.
++	 */
++	atomic_inc(&session->task_count);
++	mpp_session_push_pending(session, task);
++	mpp_debug_func(DEBUG_TASK_INFO, "session %d:%d task %d state 0x%lx\n",
++		       session->device_type, session->index,
++		       task->task_index, task->state);
++
++	return 0;
++}
++
++static int mpp_process_task(struct mpp_session *session,
++			    struct mpp_task_msgs *msgs)
++{
++	if (likely(session->process_task))
++		return session->process_task(session, msgs);
++
++	pr_err("invalid NULL process task function\n");
++	return -EINVAL;
++}
++
++struct reset_control *
++mpp_reset_control_get(struct mpp_dev *mpp, enum MPP_RESET_TYPE type, const char *name)
++{
++	int index;
++	struct reset_control *rst = NULL;
++	char shared_name[32] = "shared_";
++	struct mpp_reset_group *group;
++
++	/* check reset whether belone to device alone */
++	index = of_property_match_string(mpp->dev->of_node, "reset-names", name);
++	if (index >= 0) {
++		rst = devm_reset_control_get(mpp->dev, name);
++		mpp_safe_unreset(rst);
++
++		return rst;
++	}
++
++	/* check reset whether is shared */
++	strncat(shared_name, name,
++		sizeof(shared_name) - strlen(shared_name) - 1);
++	index = of_property_match_string(mpp->dev->of_node,
++					 "reset-names", shared_name);
++	if (index < 0) {
++		dev_err(mpp->dev, "%s is not found!\n", shared_name);
++		return NULL;
++	}
++
++	if (!mpp->reset_group) {
++		dev_err(mpp->dev, "reset group is empty!\n");
++		return NULL;
++	}
++	group = mpp->reset_group;
++
++	down_write(&group->rw_sem);
++	rst = group->resets[type];
++	if (!rst) {
++		rst = devm_reset_control_get(mpp->dev, shared_name);
++		mpp_safe_unreset(rst);
++		group->resets[type] = rst;
++		group->queue = mpp->queue;
++	}
++	dev_info(mpp->dev, "reset_group->rw_sem_on=%d\n", group->rw_sem_on);
++	up_write(&group->rw_sem);
++
++	return rst;
++}
++
++int mpp_dev_reset(struct mpp_dev *mpp)
++{
++	dev_info(mpp->dev, "resetting...\n");
++
++	disable_irq(mpp->irq);
++	if (mpp->iommu_info && mpp->iommu_info->got_irq)
++		disable_irq(mpp->iommu_info->irq);
++	/*
++	 * before running, we have to switch grf ctrl bit to ensure
++	 * working in current hardware
++	 */
++	if (mpp->hw_ops->set_grf)
++		mpp->hw_ops->set_grf(mpp);
++	else
++		mpp_set_grf(mpp->grf_info);
++
++	if (mpp->auto_freq_en && mpp->hw_ops->reduce_freq)
++		mpp->hw_ops->reduce_freq(mpp);
++	/* FIXME lock resource lock of the other devices in combo */
++	mpp_iommu_down_write(mpp->iommu_info);
++	mpp_reset_down_write(mpp->reset_group);
++	atomic_set(&mpp->reset_request, 0);
++
++	if (mpp->hw_ops->reset)
++		mpp->hw_ops->reset(mpp);
++
++	/* Note: if the domain does not change, iommu attach will be return
++	 * as an empty operation. Therefore, force to close and then open,
++	 * will be update the domain. In this way, domain can really attach.
++	 */
++	mpp_iommu_refresh(mpp->iommu_info, mpp->dev);
++
++	mpp_reset_up_write(mpp->reset_group);
++	mpp_iommu_up_write(mpp->iommu_info);
++
++	enable_irq(mpp->irq);
++	if (mpp->iommu_info && mpp->iommu_info->got_irq)
++		enable_irq(mpp->iommu_info->irq);
++
++	dev_info(mpp->dev, "reset done\n");
++
++	return 0;
++}
++
++void mpp_task_run_begin(struct mpp_task *task, u32 timing_en, u32 timeout)
++{
++	preempt_disable();
++
++	set_bit(TASK_STATE_START, &task->state);
++
++	mpp_time_record(task);
++	schedule_delayed_work(&task->timeout_work, msecs_to_jiffies(timeout));
++
++	if (timing_en) {
++		task->on_sched_timeout = ktime_get();
++		set_bit(TASK_TIMING_TO_SCHED, &task->state);
++	}
++}
++
++void mpp_task_run_end(struct mpp_task *task, u32 timing_en)
++{
++	if (timing_en) {
++		task->on_run_end = ktime_get();
++		set_bit(TASK_TIMING_RUN_END, &task->state);
++	}
++
++#ifdef MODULE
++	preempt_enable();
++#else
++	preempt_enable_no_resched();
++#endif
++}
++
++static int mpp_task_run(struct mpp_dev *mpp,
++			struct mpp_task *task)
++{
++	int ret;
++	struct mpp_session *session = task->session;
++
++	mpp_debug_enter();
++
++	if (mpp->srv->timing_en) {
++		task->on_run = ktime_get();
++		set_bit(TASK_TIMING_RUN, &task->state);
++	}
++
++	/*
++	 * before running, we have to switch grf ctrl bit to ensure
++	 * working in current hardware
++	 */
++	if (mpp->hw_ops->set_grf) {
++		ret = mpp->hw_ops->set_grf(mpp);
++		if (ret) {
++			dev_err(mpp->dev, "set grf failed\n");
++			return ret;
++		}
++	} else {
++		mpp_set_grf(mpp->grf_info);
++	}
++	/*
++	 * Lock the reader locker of the device resource lock here,
++	 * release at the finish operation
++	 */
++	mpp_reset_down_read(mpp->reset_group);
++
++	/*
++	 * for iommu share hardware, should attach to ensure
++	 * working in current device
++	 */
++	ret = mpp_iommu_attach(mpp->iommu_info);
++	if (ret) {
++		dev_err(mpp->dev, "mpp_iommu_attach failed\n");
++		mpp_reset_up_read(mpp->reset_group);
++		return -ENODATA;
++	}
++
++	mpp_power_on(mpp);
++	mpp_debug_func(DEBUG_TASK_INFO, "%s session %d:%d task %d state 0x%lx\n",
++		       dev_name(mpp->dev), session->device_type,
++		       session->index, task->task_index, task->state);
++
++	if (mpp->auto_freq_en && mpp->hw_ops->set_freq)
++		mpp->hw_ops->set_freq(mpp, task);
++
++	mpp_iommu_dev_activate(mpp->iommu_info, mpp);
++	if (mpp->dev_ops->run)
++		mpp->dev_ops->run(mpp, task);
++
++	mpp_debug_leave();
++
++	return 0;
++}
++
++void mpp_dev_load(struct mpp_dev *mpp, struct mpp_task *mpp_task)
++{
++	struct mpp_load_info *load_info = &mpp->load_info;
++	ktime_t now;
++	s64 time_diff_us;
++
++	if (!mpp->srv->load_interval) {
++		if (mpp->load_en) {
++			mpp_dev_load_clear(mpp);
++			mpp->srv->timing_en = 0;
++			mpp->load_en = 0;
++		}
++		return;
++	}
++
++	if (!mpp->load_en) {
++		mpp->srv->timing_en = 1;
++		mpp->load_en = 1;
++		load_info->load_time = ktime_get();
++		return;
++	}
++
++	if (!mpp_task->on_run)
++		return;
++
++	now = ktime_get();
++	time_diff_us = ktime_us_delta(now, load_info->load_time);
++	load_info->busy_time += ktime_us_delta(now, mpp_task->on_run);
++	if (mpp_task->hw_time)
++		load_info->hw_busy_time += mpp_task->hw_time;
++	else
++		load_info->hw_busy_time += ktime_us_delta(mpp_task->on_irq,
++							  mpp_task->on_sched_timeout);
++	/* 1s update */
++	if (time_diff_us > mpp->srv->load_interval * 1000) {
++		u32 tmp = div64_s64(load_info->busy_time * 10000, time_diff_us);
++		u32 load = tmp / 100;
++		u32 load_frac = tmp % 100;
++		u32 max_load = 100;
++
++		if (mpp->queue->core_count > 1)
++			max_load *= mpp->queue->core_count;
++
++		load_info->load = load > max_load ? max_load : load;
++		load_info->load_frac = load > max_load ? 0 : load_frac;
++
++		tmp = div64_s64(load_info->hw_busy_time * 10000, time_diff_us);
++		load = tmp / 100;
++		load_frac = tmp % 100;
++		load_info->utilization = load > max_load ? max_load : load;
++		load_info->utilization_frac = load > max_load ? 0 : load_frac;
++
++		load_info->busy_time = 0;
++		load_info->hw_busy_time = 0;
++		load_info->load_time = now;
++	}
++}
++
++void mpp_dev_load_clear(struct mpp_dev *mpp)
++{
++	struct mpp_load_info *load_info = &mpp->load_info;
++
++	memset(load_info, 0, sizeof(*load_info));
++}
++
++static void try_process_running_task(struct mpp_dev *mpp)
++{
++	struct mpp_task *mpp_task, *n;
++	struct mpp_taskqueue *queue = mpp->queue;
++
++	/* try process running task */
++	list_for_each_entry_safe(mpp_task, n, &queue->running_list, queue_link) {
++		mpp = mpp_get_task_used_device(mpp_task, mpp_task->session);
++		disable_irq(mpp->irq);
++		if (!test_bit(TASK_STATE_HANDLE, &mpp_task->state)) {
++			enable_irq(mpp->irq);
++			continue;
++		}
++
++		/* process timeout task */
++		if (test_bit(TASK_STATE_TIMEOUT, &mpp_task->state)) {
++			atomic_inc(&mpp->reset_request);
++			mpp_iommu_dev_deactivate(mpp->iommu_info, mpp);
++		}
++
++		if (mpp->auto_freq_en && mpp->hw_ops->reduce_freq &&
++		    list_empty(&mpp->queue->pending_list))
++			mpp->hw_ops->reduce_freq(mpp);
++		mpp_dev_load(mpp, mpp_task);
++		if (mpp->dev_ops->isr)
++			mpp->dev_ops->isr(mpp);
++		enable_irq(mpp->irq);
++	}
++}
++
++static void mpp_task_worker_default(struct kthread_work *work_s)
++{
++	struct mpp_task *task;
++	struct mpp_dev *mpp = container_of(work_s, struct mpp_dev, work);
++	struct mpp_taskqueue *queue = mpp->queue;
++
++	mpp_debug_enter();
++
++	try_process_running_task(mpp);
++again:
++	task = mpp_taskqueue_get_pending_task(queue);
++	if (!task)
++		goto done;
++
++	/* if task timeout and aborted, remove it */
++	if (atomic_read(&task->abort_request) > 0) {
++		mpp_taskqueue_pop_pending(queue, task);
++		goto again;
++	}
++
++	/* get device for current task */
++	mpp = task->session->mpp;
++
++	/*
++	 * In the link table mode, the prepare function of the device
++	 * will check whether I can insert a new task into device.
++	 * If the device supports the task status query(like the HEVC
++	 * encoder), it can report whether the device is busy.
++	 * If the device does not support multiple task or task status
++	 * query, leave this job to mpp service.
++	 */
++	if (mpp->dev_ops->prepare)
++		task = mpp->dev_ops->prepare(mpp, task);
++	else if (mpp_taskqueue_is_running(queue))
++		task = NULL;
++
++	/*
++	 * FIXME if the hardware supports task query, but we still need to lock
++	 * the running list and lock the mpp service in the current state.
++	 */
++	/* Push a pending task to running queue */
++	if (task) {
++		struct mpp_dev *task_mpp = mpp_get_task_used_device(task, task->session);
++
++		atomic_inc(&task_mpp->task_count);
++		mpp_taskqueue_pending_to_run(queue, task);
++		set_bit(TASK_STATE_RUNNING, &task->state);
++		if (mpp_task_run(task_mpp, task))
++			mpp_taskqueue_pop_running(queue, task);
++		else
++			goto again;
++	}
++
++done:
++	mpp_session_cleanup_detach(queue, work_s);
++}
++
++static int mpp_wait_result_default(struct mpp_session *session,
++				   struct mpp_task_msgs *msgs)
++{
++	int ret;
++	struct mpp_task *task;
++	struct mpp_dev *mpp;
++
++	task = mpp_session_get_pending_task(session);
++	if (!task) {
++		mpp_err("session %d:%d pending list is empty!\n",
++			session->pid, session->index);
++		return -EIO;
++	}
++	mpp = mpp_get_task_used_device(task, session);
++
++	ret = wait_event_interruptible(task->wait, test_bit(TASK_STATE_DONE, &task->state));
++	if (ret == -ERESTARTSYS)
++		mpp_err("wait task break by signal\n");
++
++	if (mpp->dev_ops->result)
++		ret = mpp->dev_ops->result(mpp, task, msgs);
++	mpp_debug_func(DEBUG_TASK_INFO, "wait done session %d:%d count %d task %d state %lx\n",
++		       session->device_type, session->index, atomic_read(&session->task_count),
++		       task->task_index, task->state);
++
++	mpp_session_pop_pending(session, task);
++
++	return ret;
++}
++
++static int mpp_wait_result(struct mpp_session *session,
++			   struct mpp_task_msgs *msgs)
++{
++	if (likely(session->wait_result))
++		return session->wait_result(session, msgs);
++
++	pr_err("invalid NULL wait result function\n");
++	return -EINVAL;
++}
++
++static int mpp_attach_service(struct mpp_dev *mpp, struct device *dev)
++{
++	u32 taskqueue_node = 0;
++	u32 reset_group_node = 0;
++	struct device_node *np = NULL;
++	struct platform_device *pdev = NULL;
++	struct mpp_taskqueue *queue = NULL;
++	int ret = 0;
++
++	np = of_parse_phandle(dev->of_node, "rockchip,srv", 0);
++	if (!np || !of_device_is_available(np)) {
++		dev_err(dev, "failed to get the mpp service node\n");
++		return -ENODEV;
++	}
++
++	pdev = of_find_device_by_node(np);
++	of_node_put(np);
++	if (!pdev) {
++		dev_err(dev, "failed to get mpp service from node\n");
++		return -ENODEV;
++	}
++
++	mpp->srv = platform_get_drvdata(pdev);
++	platform_device_put(pdev);
++	if (!mpp->srv) {
++		dev_err(dev, "failed attach service\n");
++		return -EINVAL;
++	}
++
++	ret = of_property_read_u32(dev->of_node,
++				   "rockchip,taskqueue-node", &taskqueue_node);
++	if (ret) {
++		dev_err(dev, "failed to get taskqueue-node\n");
++		return ret;
++	} else if (taskqueue_node >= mpp->srv->taskqueue_cnt) {
++		dev_err(dev, "taskqueue-node %d must less than %d\n",
++			taskqueue_node, mpp->srv->taskqueue_cnt);
++		return -ENODEV;
++	}
++	/* set taskqueue according dtsi */
++	queue = mpp->srv->task_queues[taskqueue_node];
++	if (!queue) {
++		dev_err(dev, "taskqueue attach to invalid node %d\n",
++			taskqueue_node);
++		return -ENODEV;
++	}
++	mpp_attach_workqueue(mpp, queue);
++
++	ret = of_property_read_u32(dev->of_node,
++				   "rockchip,resetgroup-node", &reset_group_node);
++	if (!ret) {
++		/* set resetgroup according dtsi */
++		if (reset_group_node >= mpp->srv->reset_group_cnt) {
++			dev_err(dev, "resetgroup-node %d must less than %d\n",
++				reset_group_node, mpp->srv->reset_group_cnt);
++			return -ENODEV;
++		} else {
++			mpp->reset_group = mpp->srv->reset_groups[reset_group_node];
++			if (!mpp->reset_group->queue)
++				mpp->reset_group->queue = queue;
++			if (mpp->reset_group->queue != mpp->queue)
++				mpp->reset_group->rw_sem_on = true;
++		}
++	}
++
++	return 0;
++}
++
++struct mpp_taskqueue *mpp_taskqueue_init(struct device *dev)
++{
++	struct mpp_taskqueue *queue = devm_kzalloc(dev, sizeof(*queue),
++						   GFP_KERNEL);
++	if (!queue)
++		return NULL;
++
++	mutex_init(&queue->session_lock);
++	mutex_init(&queue->pending_lock);
++	spin_lock_init(&queue->running_lock);
++	mutex_init(&queue->mmu_lock);
++	mutex_init(&queue->dev_lock);
++	INIT_LIST_HEAD(&queue->session_attach);
++	INIT_LIST_HEAD(&queue->session_detach);
++	INIT_LIST_HEAD(&queue->pending_list);
++	INIT_LIST_HEAD(&queue->running_list);
++	INIT_LIST_HEAD(&queue->mmu_list);
++	INIT_LIST_HEAD(&queue->dev_list);
++
++	/* default taskqueue has max 16 task capacity */
++	queue->task_capacity = MPP_MAX_TASK_CAPACITY;
++	atomic_set(&queue->reset_request, 0);
++	atomic_set(&queue->detach_count, 0);
++	atomic_set(&queue->task_id, 0);
++	queue->dev_active_flags = 0;
++
++	return queue;
++}
++
++static void mpp_attach_workqueue(struct mpp_dev *mpp,
++				 struct mpp_taskqueue *queue)
++{
++	s32 core_id;
++
++	INIT_LIST_HEAD(&mpp->queue_link);
++
++	mutex_lock(&queue->dev_lock);
++
++	if (mpp->core_id >= 0)
++		core_id = mpp->core_id;
++	else
++		core_id = queue->core_count;
++
++	if (core_id < 0 || core_id >= MPP_MAX_CORE_NUM) {
++		dev_err(mpp->dev, "invalid core id %d\n", core_id);
++		goto done;
++	}
++
++	/*
++	 * multi devices with no multicores share one queue,
++	 * the core_id is default value 0.
++	 */
++	if (queue->cores[core_id]) {
++		if (queue->cores[core_id] == mpp)
++			goto done;
++
++		core_id = queue->core_count;
++	}
++
++	queue->cores[core_id] = mpp;
++	queue->core_count++;
++
++	set_bit(core_id, &queue->core_idle);
++	list_add_tail(&mpp->queue_link, &queue->dev_list);
++	if (queue->core_id_max < (u32)core_id)
++		queue->core_id_max = (u32)core_id;
++
++	mpp->core_id = core_id;
++	mpp->queue = queue;
++
++	mpp_dbg_core("%s attach queue as core %d\n",
++			dev_name(mpp->dev), mpp->core_id);
++
++	if (queue->task_capacity > mpp->task_capacity)
++		queue->task_capacity = mpp->task_capacity;
++
++done:
++	mutex_unlock(&queue->dev_lock);
++}
++
++static void mpp_detach_workqueue(struct mpp_dev *mpp)
++{
++	struct mpp_taskqueue *queue = mpp->queue;
++
++	if (queue) {
++		mutex_lock(&queue->dev_lock);
++
++		queue->cores[mpp->core_id] = NULL;
++		queue->core_count--;
++
++		clear_bit(mpp->core_id, &queue->core_idle);
++		list_del_init(&mpp->queue_link);
++
++		mpp->queue = NULL;
++
++		mutex_unlock(&queue->dev_lock);
++	}
++}
++
++static int mpp_check_cmd_v1(__u32 cmd)
++{
++	bool found;
++
++	found = (cmd < MPP_CMD_QUERY_BUTT) ? true : false;
++	found = (cmd >= MPP_CMD_INIT_BASE && cmd < MPP_CMD_INIT_BUTT) ? true : found;
++	found = (cmd >= MPP_CMD_SEND_BASE && cmd < MPP_CMD_SEND_BUTT) ? true : found;
++	found = (cmd >= MPP_CMD_POLL_BASE && cmd < MPP_CMD_POLL_BUTT) ? true : found;
++	found = (cmd >= MPP_CMD_CONTROL_BASE && cmd < MPP_CMD_CONTROL_BUTT) ? true : found;
++
++	return found ? 0 : -EINVAL;
++}
++
++static inline int mpp_msg_is_last(struct mpp_request *req)
++{
++	int flag;
++
++	if (req->flags & MPP_FLAGS_MULTI_MSG)
++		flag = (req->flags & MPP_FLAGS_LAST_MSG) ? 1 : 0;
++	else
++		flag = 1;
++
++	return flag;
++}
++
++static __u32 mpp_get_cmd_butt(__u32 cmd)
++{
++	__u32 mask = 0;
++
++	switch (cmd) {
++	case MPP_CMD_QUERY_BASE:
++		mask = MPP_CMD_QUERY_BUTT;
++		break;
++	case MPP_CMD_INIT_BASE:
++		mask = MPP_CMD_INIT_BUTT;
++		break;
++
++	case MPP_CMD_SEND_BASE:
++		mask = MPP_CMD_SEND_BUTT;
++		break;
++	case MPP_CMD_POLL_BASE:
++		mask = MPP_CMD_POLL_BUTT;
++		break;
++	case MPP_CMD_CONTROL_BASE:
++		mask = MPP_CMD_CONTROL_BUTT;
++		break;
++	default:
++		mpp_err("unknown dev cmd 0x%x\n", cmd);
++		break;
++	}
++
++	return mask;
++}
++
++static int mpp_process_request(struct mpp_session *session,
++			       struct mpp_service *srv,
++			       struct mpp_request *req,
++			       struct mpp_task_msgs *msgs)
++{
++	int ret;
++	struct mpp_dev *mpp;
++
++	mpp_debug(DEBUG_IOCTL, "cmd %x process\n", req->cmd);
++
++	switch (req->cmd) {
++	case MPP_CMD_QUERY_HW_SUPPORT: {
++		u32 hw_support = srv->hw_support;
++
++		mpp_debug(DEBUG_IOCTL, "hw_support %08x\n", hw_support);
++		if (put_user(hw_support, (u32 __user *)req->data))
++			return -EFAULT;
++	} break;
++	case MPP_CMD_QUERY_HW_ID: {
++		struct mpp_hw_info *hw_info;
++
++		mpp = NULL;
++		if (session && session->mpp) {
++			mpp = session->mpp;
++		} else {
++			u32 client_type;
++
++			if (get_user(client_type, (u32 __user *)req->data))
++				return -EFAULT;
++
++			mpp_debug(DEBUG_IOCTL, "client %d\n", client_type);
++			client_type = array_index_nospec(client_type, MPP_DEVICE_BUTT);
++			if (test_bit(client_type, &srv->hw_support))
++				mpp = srv->sub_devices[client_type];
++		}
++
++		if (!mpp)
++			return -EINVAL;
++
++		hw_info = mpp->var->hw_info;
++		mpp_debug(DEBUG_IOCTL, "hw_id %08x\n", hw_info->hw_id);
++		if (put_user(hw_info->hw_id, (u32 __user *)req->data))
++			return -EFAULT;
++	} break;
++	case MPP_CMD_QUERY_CMD_SUPPORT: {
++		__u32 cmd = 0;
++
++		if (get_user(cmd, (u32 __user *)req->data))
++			return -EINVAL;
++
++		if (put_user(mpp_get_cmd_butt(cmd), (u32 __user *)req->data))
++			return -EFAULT;
++	} break;
++	case MPP_CMD_INIT_CLIENT_TYPE: {
++		u32 client_type;
++
++		if (get_user(client_type, (u32 __user *)req->data))
++			return -EFAULT;
++
++		mpp_debug(DEBUG_IOCTL, "client %d\n", client_type);
++		if (client_type >= MPP_DEVICE_BUTT) {
++			mpp_err("client_type must less than %d\n",
++				MPP_DEVICE_BUTT);
++			return -EINVAL;
++		}
++		client_type = array_index_nospec(client_type, MPP_DEVICE_BUTT);
++		mpp = srv->sub_devices[client_type];
++		if (!mpp)
++			return -EINVAL;
++
++		session->device_type = (enum MPP_DEVICE_TYPE)client_type;
++		session->dma = mpp_dma_session_create(mpp->dev, mpp->session_max_buffers);
++		session->mpp = mpp;
++		if (mpp->dev_ops) {
++			if (mpp->dev_ops->process_task)
++				session->process_task =
++					mpp->dev_ops->process_task;
++
++			if (mpp->dev_ops->wait_result)
++				session->wait_result =
++					mpp->dev_ops->wait_result;
++
++			if (mpp->dev_ops->deinit)
++				session->deinit = mpp->dev_ops->deinit;
++		}
++		session->index = atomic_fetch_inc(&mpp->session_index);
++		if (mpp->dev_ops && mpp->dev_ops->init_session) {
++			ret = mpp->dev_ops->init_session(session);
++			if (ret)
++				return ret;
++		}
++
++		mpp_session_attach_workqueue(session, mpp->queue);
++	} break;
++	case MPP_CMD_INIT_DRIVER_DATA: {
++		u32 val;
++
++		mpp = session->mpp;
++		if (!mpp)
++			return -EINVAL;
++		if (get_user(val, (u32 __user *)req->data))
++			return -EFAULT;
++		if (mpp->grf_info->grf)
++			regmap_write(mpp->grf_info->grf, 0x5d8, val);
++	} break;
++	case MPP_CMD_INIT_TRANS_TABLE: {
++		if (session && req->size) {
++			int trans_tbl_size = sizeof(session->trans_table);
++
++			if (req->size > trans_tbl_size) {
++				mpp_err("init table size %d more than %d\n",
++					req->size, trans_tbl_size);
++				return -ENOMEM;
++			}
++
++			if (copy_from_user(session->trans_table,
++					   req->data, req->size)) {
++				mpp_err("copy_from_user failed\n");
++				return -EINVAL;
++			}
++			session->trans_count =
++				req->size / sizeof(session->trans_table[0]);
++		}
++	} break;
++	case MPP_CMD_SET_REG_WRITE:
++	case MPP_CMD_SET_REG_READ:
++	case MPP_CMD_SET_REG_ADDR_OFFSET:
++	case MPP_CMD_SET_RCB_INFO: {
++		msgs->flags |= req->flags;
++		msgs->set_cnt++;
++	} break;
++	case MPP_CMD_POLL_HW_FINISH: {
++		msgs->flags |= req->flags;
++		msgs->poll_cnt++;
++		msgs->poll_req = NULL;
++	} break;
++	case MPP_CMD_POLL_HW_IRQ: {
++		if (msgs->poll_cnt || msgs->poll_req)
++			mpp_err("Do NOT poll hw irq when previous call not return\n");
++
++		msgs->flags |= req->flags;
++		msgs->poll_cnt++;
++
++		if (req->size && req->data) {
++			if (!msgs->poll_req)
++				msgs->poll_req = req;
++		} else {
++			msgs->poll_req = NULL;
++		}
++	} break;
++	case MPP_CMD_RESET_SESSION: {
++		int ret;
++		int val;
++
++		ret = readx_poll_timeout(atomic_read,
++					 &session->task_count,
++					 val, val == 0, 1000, 500000);
++		if (ret == -ETIMEDOUT) {
++			mpp_err("wait task running time out\n");
++		} else {
++			mpp = session->mpp;
++			if (!mpp)
++				return -EINVAL;
++
++			mpp_session_clear_pending(session);
++			mpp_iommu_down_write(mpp->iommu_info);
++			ret = mpp_dma_session_destroy(session->dma);
++			mpp_iommu_up_write(mpp->iommu_info);
++		}
++		return ret;
++	} break;
++	case MPP_CMD_TRANS_FD_TO_IOVA: {
++		u32 i;
++		u32 count;
++		u32 data[MPP_MAX_REG_TRANS_NUM];
++
++		mpp = session->mpp;
++		if (!mpp)
++			return -EINVAL;
++
++		if (req->size <= 0 ||
++		    req->size > sizeof(data))
++			return -EINVAL;
++
++		memset(data, 0, sizeof(data));
++		if (copy_from_user(data, req->data, req->size)) {
++			mpp_err("copy_from_user failed.\n");
++			return -EINVAL;
++		}
++		count = req->size / sizeof(u32);
++		for (i = 0; i < count; i++) {
++			struct mpp_dma_buffer *buffer;
++			int fd = data[i];
++
++			mpp_iommu_down_read(mpp->iommu_info);
++			buffer = mpp_dma_import_fd(mpp->iommu_info,
++						   session->dma, fd, 1);
++			mpp_iommu_up_read(mpp->iommu_info);
++			if (IS_ERR_OR_NULL(buffer)) {
++				mpp_err("can not import fd %d\n", fd);
++				return -EINVAL;
++			}
++			data[i] = (u32)buffer->iova;
++			mpp_debug(DEBUG_IOMMU, "fd %d => iova %08x\n",
++				  fd, data[i]);
++		}
++		if (copy_to_user(req->data, data, req->size)) {
++			mpp_err("copy_to_user failed.\n");
++			return -EINVAL;
++		}
++	} break;
++	case MPP_CMD_RELEASE_FD: {
++		u32 i;
++		int ret;
++		u32 count;
++		u32 data[MPP_MAX_REG_TRANS_NUM];
++
++		if (req->size <= 0 ||
++		    req->size > sizeof(data))
++			return -EINVAL;
++
++		memset(data, 0, sizeof(data));
++		if (copy_from_user(data, req->data, req->size)) {
++			mpp_err("copy_from_user failed.\n");
++			return -EINVAL;
++		}
++		count = req->size / sizeof(u32);
++		for (i = 0; i < count; i++) {
++			ret = mpp_dma_release_fd(session->dma, data[i]);
++			if (ret) {
++				mpp_err("release fd %d failed.\n", data[i]);
++				return ret;
++			}
++		}
++	} break;
++	default: {
++		mpp = session->mpp;
++		if (!mpp) {
++			mpp_err("pid %d not find client %d\n",
++				session->pid, session->device_type);
++			return -EINVAL;
++		}
++		if (mpp->dev_ops->ioctl)
++			return mpp->dev_ops->ioctl(session, req);
++
++		mpp_debug(DEBUG_IOCTL, "unknown mpp ioctl cmd %x\n", req->cmd);
++	} break;
++	}
++
++	return 0;
++}
++
++static void task_msgs_add(struct mpp_task_msgs *msgs, struct list_head *head)
++{
++	struct mpp_session *session = msgs->session;
++	int ret = 0;
++
++	/* process each task */
++	if (msgs->set_cnt) {
++		/* NOTE: update msg_flags for fd over 1024 */
++		session->msg_flags = msgs->flags;
++		ret = mpp_process_task(session, msgs);
++	}
++
++	if (!ret) {
++		INIT_LIST_HEAD(&msgs->list);
++		list_add_tail(&msgs->list, head);
++	} else {
++		put_task_msgs(msgs);
++	}
++}
++
++static int mpp_collect_msgs(struct list_head *head, struct mpp_session *session,
++			    unsigned int cmd, void __user *msg)
++{
++	struct mpp_msg_v1 msg_v1;
++	struct mpp_request *req;
++	struct mpp_task_msgs *msgs = NULL;
++	int last = 1;
++	int ret;
++
++	if (cmd != MPP_IOC_CFG_V1) {
++		mpp_err("unknown ioctl cmd %x\n", cmd);
++		return -EINVAL;
++	}
++
++next:
++	/* first, parse to fixed struct */
++	if (copy_from_user(&msg_v1, msg, sizeof(msg_v1)))
++		return -EFAULT;
++
++	msg += sizeof(msg_v1);
++
++	mpp_debug(DEBUG_IOCTL, "cmd %x collect flags %08x, size %d, offset %x\n",
++		  msg_v1.cmd, msg_v1.flags, msg_v1.size, msg_v1.offset);
++
++	if (mpp_check_cmd_v1(msg_v1.cmd)) {
++		mpp_err("mpp cmd %x is not supported.\n", msg_v1.cmd);
++		return -EFAULT;
++	}
++
++	if (msg_v1.flags & MPP_FLAGS_MULTI_MSG)
++		last = (msg_v1.flags & MPP_FLAGS_LAST_MSG) ? 1 : 0;
++	else
++		last = 1;
++
++	/* check cmd for change msgs session */
++	if (msg_v1.cmd == MPP_CMD_SET_SESSION_FD) {
++		struct mpp_bat_msg bat_msg;
++		struct mpp_bat_msg __user *usr_cmd;
++		struct fd f;
++
++		/* try session switch here */
++		usr_cmd = (struct mpp_bat_msg __user *)(unsigned long)msg_v1.data_ptr;
++
++		if (copy_from_user(&bat_msg, usr_cmd, sizeof(bat_msg)))
++			return -EFAULT;
++
++		/* skip finished message */
++		if (bat_msg.flag & MPP_BAT_MSG_DONE)
++			goto session_switch_done;
++
++		f = fdget(bat_msg.fd);
++		if (fd_empty(f)) {
++			int ret = -EBADF;
++
++			mpp_err("fd %d get session failed\n", bat_msg.fd);
++
++			if (copy_to_user(&usr_cmd->ret, &ret, sizeof(usr_cmd->ret)))
++				mpp_err("copy_to_user failed.\n");
++			goto session_switch_done;
++		}
++
++		/* NOTE: add previous ready task to queue and drop empty task */
++		if (msgs) {
++			if (msgs->req_cnt)
++				task_msgs_add(msgs, head);
++			else
++				put_task_msgs(msgs);
++
++			msgs = NULL;
++		}
++
++		/* switch session */
++		session = fd_file(f)->private_data;
++		msgs = get_task_msgs(session);
++
++		if (fd_file(f)->private_data == session)
++			msgs->ext_fd = bat_msg.fd;
++
++		msgs->f = f;
++
++		mpp_debug(DEBUG_IOCTL, "fd %d, session %d msg_cnt %d\n",
++				bat_msg.fd, session->index, session->msgs_cnt);
++
++session_switch_done:
++		/* session id should NOT be the last message */
++		if (last)
++			return 0;
++
++		goto next;
++	}
++
++	if (!msgs)
++		msgs = get_task_msgs(session);
++
++	if (!msgs) {
++		pr_err("session %d:%d failed to get task msgs",
++		       session->pid, session->index);
++		return -EINVAL;
++	}
++
++	if (msgs->req_cnt >= MPP_MAX_MSG_NUM) {
++		mpp_err("session %d message count %d more than %d.\n",
++			session->index, msgs->req_cnt, MPP_MAX_MSG_NUM);
++		return -EINVAL;
++	}
++
++	req = &msgs->reqs[msgs->req_cnt++];
++	req->cmd = msg_v1.cmd;
++	req->flags = msg_v1.flags;
++	req->size = msg_v1.size;
++	req->offset = msg_v1.offset;
++	req->data = (void __user *)(unsigned long)msg_v1.data_ptr;
++
++	ret = mpp_process_request(session, session->srv, req, msgs);
++	if (ret) {
++		mpp_err("session %d process cmd %x ret %d\n",
++			session->index, req->cmd, ret);
++		return ret;
++	}
++
++	if (!last)
++		goto next;
++
++	task_msgs_add(msgs, head);
++	msgs = NULL;
++
++	return 0;
++}
++
++static void mpp_msgs_trigger(struct list_head *msgs_list)
++{
++	struct mpp_task_msgs *msgs, *n;
++	struct mpp_dev *mpp_prev = NULL;
++	struct mpp_taskqueue *queue_prev = NULL;
++
++	/* push task to queue */
++	list_for_each_entry_safe(msgs, n, msgs_list, list) {
++		struct mpp_dev *mpp;
++		struct mpp_task *task;
++		struct mpp_taskqueue *queue;
++
++		if (!msgs->set_cnt || !msgs->queue)
++			continue;
++
++		mpp = msgs->mpp;
++		task = msgs->task;
++		queue = msgs->queue;
++
++		if (queue_prev != queue) {
++			if (queue_prev && mpp_prev) {
++				mutex_unlock(&queue_prev->pending_lock);
++				mpp_taskqueue_trigger_work(mpp_prev);
++			}
++
++			if (queue)
++				mutex_lock(&queue->pending_lock);
++
++			mpp_prev = mpp;
++			queue_prev = queue;
++		}
++
++		if (test_bit(TASK_STATE_ABORT, &task->state))
++			pr_info("try to trigger abort task %d\n", task->task_id);
++
++		set_bit(TASK_STATE_PENDING, &task->state);
++		list_add_tail(&task->queue_link, &queue->pending_list);
++	}
++
++	if (mpp_prev && queue_prev) {
++		mutex_unlock(&queue_prev->pending_lock);
++		mpp_taskqueue_trigger_work(mpp_prev);
++	}
++}
++
++static void mpp_msgs_wait(struct list_head *msgs_list)
++{
++	struct mpp_task_msgs *msgs, *n;
++
++	/* poll and release each task */
++	list_for_each_entry_safe(msgs, n, msgs_list, list) {
++		struct mpp_session *session = msgs->session;
++
++		if (msgs->poll_cnt) {
++			int ret = mpp_wait_result(session, msgs);
++
++			if (ret) {
++				mpp_err("session %d wait result ret %d\n",
++					session->index, ret);
++			}
++		}
++
++		put_task_msgs(msgs);
++
++	}
++}
++
++static long mpp_dev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
++{
++	struct mpp_service *srv;
++	struct mpp_session *session = (struct mpp_session *)filp->private_data;
++	struct list_head msgs_list;
++	int ret = 0;
++
++	mpp_debug_enter();
++
++	if (!session || !session->srv) {
++		mpp_err("session %p\n", session);
++		return -EINVAL;
++	}
++
++	srv = session->srv;
++
++	if (atomic_read(&session->release_request) > 0) {
++		mpp_debug(DEBUG_IOCTL, "release session had request\n");
++		return -EBUSY;
++	}
++	if (atomic_read(&srv->shutdown_request) > 0) {
++		mpp_debug(DEBUG_IOCTL, "shutdown had request\n");
++		return -EBUSY;
++	}
++
++	INIT_LIST_HEAD(&msgs_list);
++
++	ret = mpp_collect_msgs(&msgs_list, session, cmd, (void __user *)arg);
++	if (ret)
++		mpp_err("collect msgs failed %d\n", ret);
++
++	mpp_msgs_trigger(&msgs_list);
++
++	mpp_msgs_wait(&msgs_list);
++
++	mpp_debug_leave();
++
++	return ret;
++}
++
++static int mpp_dev_open(struct inode *inode, struct file *filp)
++{
++	struct mpp_session *session = NULL;
++	struct mpp_service *srv = container_of(inode->i_cdev,
++					       struct mpp_service,
++					       mpp_cdev);
++	mpp_debug_enter();
++
++	session = mpp_session_init();
++	if (!session)
++		return -ENOMEM;
++
++	session->srv = srv;
++
++	if (session->srv) {
++		mutex_lock(&srv->session_lock);
++		list_add_tail(&session->service_link, &srv->session_list);
++		mutex_unlock(&srv->session_lock);
++	}
++	session->process_task = mpp_process_task_default;
++	session->wait_result = mpp_wait_result_default;
++	session->deinit = mpp_session_deinit_default;
++	filp->private_data = (void *)session;
++
++	mpp_debug_leave();
++
++	return nonseekable_open(inode, filp);
++}
++
++static int mpp_dev_release(struct inode *inode, struct file *filp)
++{
++	struct mpp_session *session = filp->private_data;
++
++	mpp_debug_enter();
++
++	if (!session) {
++		mpp_err("session is null\n");
++		return -EINVAL;
++	}
++
++	/* wait for task all done */
++	atomic_inc(&session->release_request);
++
++	if (session->mpp || atomic_read(&session->task_count))
++		mpp_session_detach_workqueue(session);
++	else
++		mpp_session_deinit(session);
++
++	filp->private_data = NULL;
++
++	mpp_debug_leave();
++	return 0;
++}
++
++const struct file_operations rockchip_mpp_fops = {
++	.open		= mpp_dev_open,
++	.release	= mpp_dev_release,
++	.unlocked_ioctl = mpp_dev_ioctl,
++#ifdef CONFIG_COMPAT
++	.compat_ioctl   = mpp_dev_ioctl,
++#endif
++};
++
++struct mpp_mem_region *
++mpp_task_attach_fd(struct mpp_task *task, int fd)
++{
++	struct mpp_mem_region *mem_region = NULL, *loop = NULL, *n;
++	struct mpp_dma_buffer *buffer = NULL;
++	struct mpp_dev *mpp = task->session->mpp;
++	struct mpp_dma_session *dma = task->session->dma;
++	u32 mem_num = ARRAY_SIZE(task->mem_regions);
++	bool found = false;
++
++	if (fd <= 0 || !dma || !mpp)
++		return ERR_PTR(-EINVAL);
++
++	if (task->mem_count > mem_num) {
++		mpp_err("mem_count %d must less than %d\n", task->mem_count, mem_num);
++		return ERR_PTR(-ENOMEM);
++	}
++
++	/* find fd whether had import */
++	list_for_each_entry_safe_reverse(loop, n, &task->mem_region_list, reg_link) {
++		if (loop->fd == fd) {
++			found = true;
++			break;
++		}
++	}
++
++	mem_region = &task->mem_regions[task->mem_count];
++	if (found) {
++		memcpy(mem_region, loop, sizeof(*loop));
++		mem_region->is_dup = true;
++	} else {
++		mpp_iommu_down_read(mpp->iommu_info);
++		buffer = mpp_dma_import_fd(mpp->iommu_info, dma, fd, 0);
++		mpp_iommu_up_read(mpp->iommu_info);
++		if (IS_ERR(buffer)) {
++			mpp_err("can't import dma-buf %d\n", fd);
++			return ERR_CAST(buffer);
++		}
++
++		mem_region->hdl = buffer;
++		mem_region->iova = buffer->iova;
++		mem_region->len = buffer->size;
++		mem_region->fd = fd;
++		mem_region->is_dup = false;
++	}
++	task->mem_count++;
++	INIT_LIST_HEAD(&mem_region->reg_link);
++	list_add_tail(&mem_region->reg_link, &task->mem_region_list);
++
++	return mem_region;
++}
++
++int mpp_translate_reg_address(struct mpp_session *session,
++			      struct mpp_task *task, int fmt,
++			      u32 *reg, struct reg_offset_info *off_inf)
++{
++	int i;
++	int cnt;
++	const u16 *tbl;
++
++	mpp_debug_enter();
++
++	if (session->trans_count > 0) {
++		cnt = session->trans_count;
++		tbl = session->trans_table;
++	} else {
++		struct mpp_dev *mpp = mpp_get_task_used_device(task, session);
++		struct mpp_trans_info *trans_info = mpp->var->trans_info;
++
++		cnt = trans_info[fmt].count;
++		tbl = trans_info[fmt].table;
++	}
++
++	for (i = 0; i < cnt; i++) {
++		int usr_fd;
++		u32 offset;
++		struct mpp_mem_region *mem_region = NULL;
++
++		if (session->msg_flags & MPP_FLAGS_REG_NO_OFFSET) {
++			usr_fd = reg[tbl[i]];
++			offset = 0;
++		} else {
++			usr_fd = reg[tbl[i]] & 0x3ff;
++			offset = reg[tbl[i]] >> 10;
++		}
++
++		if (usr_fd == 0)
++			continue;
++
++		mem_region = mpp_task_attach_fd(task, usr_fd);
++		if (IS_ERR(mem_region)) {
++			mpp_err("reg[%3d]: 0x%08x fd %d failed\n",
++				tbl[i], reg[tbl[i]], usr_fd);
++			return PTR_ERR(mem_region);
++		}
++		mpp_debug(DEBUG_IOMMU,
++			  "reg[%3d]: %d => %pad, offset %10d, size %lx\n",
++			  tbl[i], usr_fd, &mem_region->iova,
++			  offset, mem_region->len);
++		mem_region->reg_idx = tbl[i];
++		reg[tbl[i]] = mem_region->iova + offset;
++	}
++
++	mpp_debug_leave();
++
++	return 0;
++}
++
++int mpp_check_req(struct mpp_request *req, int base,
++		  int max_size, u32 off_s, u32 off_e)
++{
++	int req_off;
++
++	if (req->offset < base) {
++		mpp_err("error: base %x, offset %x\n",
++			base, req->offset);
++		return -EINVAL;
++	}
++	req_off = req->offset - base;
++	if ((req_off + req->size) < off_s) {
++		mpp_err("error: req_off %x, req_size %x, off_s %x\n",
++			req_off, req->size, off_s);
++		return -EINVAL;
++	}
++	if (max_size < off_e) {
++		mpp_err("error: off_e %x, max_size %x\n",
++			off_e, max_size);
++		return -EINVAL;
++	}
++	if (req_off > max_size) {
++		mpp_err("error: req_off %x, max_size %x\n",
++			req_off, max_size);
++		return -EINVAL;
++	}
++	if ((req_off + req->size) > max_size) {
++		mpp_err("error: req_off %x, req_size %x, max_size %x\n",
++			req_off, req->size, max_size);
++		req->size = req_off + req->size - max_size;
++	}
++
++	return 0;
++}
++
++int mpp_extract_reg_offset_info(struct reg_offset_info *off_inf,
++				struct mpp_request *req)
++{
++	int max_size = ARRAY_SIZE(off_inf->elem);
++	int cnt = req->size / sizeof(off_inf->elem[0]);
++
++	if ((cnt + off_inf->cnt) > max_size) {
++		mpp_err("count %d, total %d, max_size %d\n",
++			cnt, off_inf->cnt, max_size);
++		return -EINVAL;
++	}
++	if (copy_from_user(&off_inf->elem[off_inf->cnt],
++			   req->data, req->size)) {
++		mpp_err("copy_from_user failed\n");
++		return -EINVAL;
++	}
++	off_inf->cnt += cnt;
++
++	return 0;
++}
++
++int mpp_query_reg_offset_info(struct reg_offset_info *off_inf,
++			      u32 index)
++{
++	mpp_debug_enter();
++	if (off_inf) {
++		int i;
++
++		for (i = 0; i < off_inf->cnt; i++) {
++			if (off_inf->elem[i].index == index)
++				return off_inf->elem[i].offset;
++		}
++	}
++	mpp_debug_leave();
++
++	return 0;
++}
++
++int mpp_translate_reg_offset_info(struct mpp_task *task,
++				  struct reg_offset_info *off_inf,
++				  u32 *reg)
++{
++	mpp_debug_enter();
++
++	if (off_inf) {
++		int i;
++
++		for (i = 0; i < off_inf->cnt; i++) {
++			mpp_debug(DEBUG_IOMMU, "reg[%d] + offset %d\n",
++				  off_inf->elem[i].index,
++				  off_inf->elem[i].offset);
++			reg[off_inf->elem[i].index] += off_inf->elem[i].offset;
++		}
++	}
++	mpp_debug_leave();
++
++	return 0;
++}
++
++int mpp_task_init(struct mpp_session *session, struct mpp_task *task)
++{
++	INIT_LIST_HEAD(&task->pending_link);
++	INIT_LIST_HEAD(&task->queue_link);
++	INIT_LIST_HEAD(&task->mem_region_list);
++	task->state = 0;
++	task->mem_count = 0;
++	task->session = session;
++
++	return 0;
++}
++
++int mpp_task_finish(struct mpp_session *session,
++		    struct mpp_task *task)
++{
++	struct mpp_dev *mpp = mpp_get_task_used_device(task, session);
++
++	if (mpp->dev_ops->finish)
++		mpp->dev_ops->finish(mpp, task);
++
++	mpp_reset_up_read(mpp->reset_group);
++	if (atomic_read(&mpp->reset_request) > 0)
++		mpp_dev_reset(mpp);
++	mpp_power_off(mpp);
++
++	set_bit(TASK_STATE_FINISH, &task->state);
++	set_bit(TASK_STATE_DONE, &task->state);
++
++	if (session->srv->timing_en) {
++		s64 time_diff;
++
++		task->on_finish = ktime_get();
++		set_bit(TASK_TIMING_FINISH, &task->state);
++
++		time_diff = ktime_us_delta(task->on_finish, task->on_create);
++
++		if (mpp->timing_check && time_diff > (s64)mpp->timing_check)
++			mpp_task_dump_timing(task, time_diff);
++	}
++
++	/* Wake up the GET thread */
++	wake_up(&task->wait);
++	mpp_taskqueue_pop_running(mpp->queue, task);
++
++	return 0;
++}
++
++int mpp_task_finalize(struct mpp_session *session,
++		      struct mpp_task *task)
++{
++	struct mpp_mem_region *mem_region = NULL, *n;
++	struct mpp_dev *mpp = mpp_get_task_used_device(task, session);
++
++	/* release memory region attach to this registers table. */
++	list_for_each_entry_safe(mem_region, n,
++				 &task->mem_region_list,
++				 reg_link) {
++		if (!mem_region->is_dup) {
++			mpp_iommu_down_read(mpp->iommu_info);
++			mpp_dma_release(session->dma, mem_region->hdl);
++			mpp_iommu_up_read(mpp->iommu_info);
++		}
++		list_del_init(&mem_region->reg_link);
++	}
++
++	return 0;
++}
++
++int mpp_task_dump_mem_region(struct mpp_dev *mpp,
++			     struct mpp_task *task)
++{
++	struct mpp_mem_region *mem = NULL, *n;
++
++	if (!task)
++		return -EIO;
++
++	mpp_err("--- dump task %d mem region ---\n", task->task_index);
++	if (!list_empty(&task->mem_region_list)) {
++		list_for_each_entry_safe(mem, n,
++					 &task->mem_region_list,
++					 reg_link) {
++			mpp_err("reg[%3d]: %pad, size %lx\n",
++				mem->reg_idx, &mem->iova, mem->len);
++		}
++	} else {
++		dev_err(mpp->dev, "no memory region mapped\n");
++	}
++
++	return 0;
++}
++
++int mpp_task_dump_reg(struct mpp_dev *mpp,
++		      struct mpp_task *task)
++{
++	if (!task)
++		return -EIO;
++
++	if (mpp_debug_unlikely(DEBUG_DUMP_ERR_REG)) {
++		mpp_err("--- dump task register ---\n");
++		if (task->reg) {
++			u32 i;
++			u32 s = task->hw_info->reg_start;
++			u32 e = task->hw_info->reg_end;
++
++			for (i = s; i <= e; i++) {
++				u32 reg = i * sizeof(u32);
++
++				mpp_err("reg[%03d]: %04x: 0x%08x\n",
++					i, reg, task->reg[i]);
++			}
++		}
++	}
++
++	return 0;
++}
++
++int mpp_task_dump_hw_reg(struct mpp_dev *mpp)
++{
++	u32 i;
++	u32 s = mpp->var->hw_info->reg_start;
++	u32 e = mpp->var->hw_info->reg_end;
++
++	mpp_err("--- dump hardware register ---\n");
++	for (i = s; i <= e; i++) {
++		u32 reg = i * sizeof(u32);
++
++		mpp_err("reg[%03d]: %04x: 0x%08x\n",
++				i, reg, readl_relaxed(mpp->reg_base + reg));
++	}
++
++	return 0;
++}
++
++void mpp_reg_show(struct mpp_dev *mpp, u32 offset)
++{
++	if (!mpp)
++		return;
++
++	dev_err(mpp->dev, "reg[%03d]: %04x: 0x%08x\n",
++		offset >> 2, offset, mpp_read_relaxed(mpp, offset));
++}
++
++void mpp_reg_show_range(struct mpp_dev *mpp, u32 start, u32 end)
++{
++	u32 offset;
++
++	if (!mpp)
++		return;
++
++	for (offset = start; offset < end; offset += sizeof(u32))
++		mpp_reg_show(mpp, offset);
++}
++
++/* The device will do more probing work after this */
++int mpp_dev_probe(struct mpp_dev *mpp,
++		  struct platform_device *pdev)
++{
++	int ret;
++	struct resource *res = NULL;
++	struct device *dev = &pdev->dev;
++	struct device_node *np = dev->of_node;
++	struct mpp_hw_info *hw_info = mpp->var->hw_info;
++
++	/* Get disable auto frequent flag from dtsi */
++	mpp->auto_freq_en = !device_property_read_bool(dev, "rockchip,disable-auto-freq");
++	/* read flag for pum idle request */
++	mpp->skip_idle = device_property_read_bool(dev, "rockchip,skip-pmu-idle-request");
++
++	/* read link table capacity */
++	ret = of_property_read_u32(np, "rockchip,task-capacity",
++				   &mpp->task_capacity);
++	if (ret)
++		mpp->task_capacity = 1;
++
++	mpp->dev = dev;
++	mpp->hw_ops = mpp->var->hw_ops;
++	mpp->dev_ops = mpp->var->dev_ops;
++
++	/* Get and attach to service */
++	ret = mpp_attach_service(mpp, dev);
++	if (ret) {
++		dev_err(dev, "failed to attach service\n");
++		return -ENODEV;
++	}
++
++	/* power domain autosuspend delay 2s */
++	pm_runtime_set_autosuspend_delay(dev, 2000);
++	pm_runtime_use_autosuspend(dev);
++
++	kthread_init_work(&mpp->work, mpp_task_worker_default);
++
++	atomic_set(&mpp->reset_request, 0);
++	atomic_set(&mpp->session_index, 0);
++	atomic_set(&mpp->task_count, 0);
++	atomic_set(&mpp->task_index, 0);
++
++	device_init_wakeup(dev, true);
++	pm_runtime_enable(dev);
++	mpp->irq = platform_get_irq(pdev, 0);
++	if (mpp->irq < 0) {
++		dev_err(dev, "No interrupt resource found\n");
++		ret = -ENODEV;
++		goto failed;
++	}
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res) {
++		dev_err(&pdev->dev, "no memory resource defined\n");
++		ret = -ENODEV;
++		goto failed;
++	}
++	/*
++	 * Tips: here can not use function devm_ioremap_resource. The resion is
++	 * that hevc and vdpu map the same register address region in rk3368.
++	 * However, devm_ioremap_resource will call function
++	 * devm_request_mem_region to check region. Thus, use function
++	 * devm_ioremap can avoid it.
++	 */
++	mpp->reg_base = devm_ioremap(dev, res->start, resource_size(res));
++	if (!mpp->reg_base) {
++		dev_err(dev, "ioremap failed for resource %pR\n", res);
++		ret = -ENOMEM;
++		goto failed;
++	}
++	mpp->io_base = res->start;
++
++	/*
++	 * TODO: here or at the device itself, some device does not
++	 * have the iommu, maybe in the device is better.
++	 */
++	mpp->iommu_info = mpp_iommu_probe(dev);
++	if (IS_ERR(mpp->iommu_info)) {
++		dev_err(dev, "failed to attach iommu\n");
++		ret = PTR_ERR(mpp->iommu_info);
++		mpp->iommu_info = NULL;
++		goto failed;
++	} else {
++		mpp->iommu_info->queue = mpp->queue;
++	}
++
++	if (mpp->hw_ops->init) {
++		ret = mpp->hw_ops->init(mpp);
++		if (ret)
++			goto failed;
++	}
++
++	/* read hardware id */
++	if (hw_info->reg_id >= 0) {
++		pm_runtime_get_sync(dev);
++		if (mpp->hw_ops->clk_on)
++			mpp->hw_ops->clk_on(mpp);
++
++		hw_info->hw_id = mpp_read(mpp, hw_info->reg_id * sizeof(u32));
++		if (mpp->hw_ops->clk_off)
++			mpp->hw_ops->clk_off(mpp);
++		pm_runtime_put_sync(dev);
++	}
++
++	return ret;
++failed:
++	mpp_detach_workqueue(mpp);
++	device_init_wakeup(dev, false);
++	pm_runtime_disable(dev);
++
++	return ret;
++}
++
++int mpp_dev_remove(struct mpp_dev *mpp)
++{
++	if (mpp->hw_ops->exit)
++		mpp->hw_ops->exit(mpp);
++
++	mpp_iommu_remove(mpp->iommu_info);
++	mpp_detach_workqueue(mpp);
++	device_init_wakeup(mpp->dev, false);
++	pm_runtime_disable(mpp->dev);
++
++	return 0;
++}
++
++void mpp_dev_shutdown(struct platform_device *pdev)
++{
++	int ret;
++	int val;
++	struct device *dev = &pdev->dev;
++	struct mpp_dev *mpp = dev_get_drvdata(dev);
++
++	dev_info(dev, "shutdown device\n");
++
++	atomic_inc(&mpp->srv->shutdown_request);
++	ret = readx_poll_timeout(atomic_read,
++				 &mpp->task_count,
++				 val, val == 0, 20000, 200000);
++	if (ret == -ETIMEDOUT)
++		dev_err(dev, "wait total %d running time out\n",
++			atomic_read(&mpp->task_count));
++	else
++		dev_info(dev, "shutdown success\n");
++}
++
++int mpp_dev_register_srv(struct mpp_dev *mpp, struct mpp_service *srv)
++{
++	enum MPP_DEVICE_TYPE device_type = mpp->var->device_type;
++
++	srv->sub_devices[device_type] = mpp;
++	set_bit(device_type, &srv->hw_support);
++
++	return 0;
++}
++
++irqreturn_t mpp_dev_irq(int irq, void *param)
++{
++	struct mpp_dev *mpp = param;
++	struct mpp_task *task = mpp->cur_task;
++	irqreturn_t irq_ret = IRQ_NONE;
++	u32 timing_en = mpp->srv->timing_en;
++
++	if (task && timing_en) {
++		task->on_irq = ktime_get();
++		set_bit(TASK_TIMING_IRQ, &task->state);
++	}
++
++	if (mpp->dev_ops->irq)
++		irq_ret = mpp->dev_ops->irq(mpp);
++
++	if (!task) {
++		mpp_debug(DEBUG_IRQ_CHECK, "error, task is null\n");
++		irq_ret = IRQ_HANDLED;
++		goto done;
++	}
++
++	if (irq_ret == IRQ_WAKE_THREAD) {
++		/* if wait or delayed work timeout, abort request will turn on,
++		 * isr should not to response, and handle it in delayed work
++		 */
++		if (test_and_set_bit(TASK_STATE_HANDLE, &task->state)) {
++			dev_err(mpp->dev, "error, task %d has been handled, irq_status %#x\n",
++				task->task_index, mpp->irq_status);
++			irq_ret = IRQ_HANDLED;
++			goto done;
++		}
++		if (timing_en) {
++			task->on_cancel_timeout = ktime_get();
++			set_bit(TASK_TIMING_TO_CANCEL, &task->state);
++		}
++		cancel_delayed_work(&task->timeout_work);
++		/* normal condition, set state and wake up isr thread */
++		set_bit(TASK_STATE_IRQ, &task->state);
++		task->irq_status = mpp->irq_status;
++		mpp_iommu_dev_deactivate(mpp->iommu_info, mpp);
++		irq_ret = IRQ_HANDLED;
++		mpp_taskqueue_trigger_work(mpp);
++	}
++
++done:
++	return irq_ret;
++}
++
++u32 mpp_get_grf(struct mpp_grf_info *grf_info)
++{
++	u32 val = 0;
++
++	if (grf_info && grf_info->grf && grf_info->val)
++		regmap_read(grf_info->grf, grf_info->offset, &val);
++
++	return (val & MPP_GRF_VAL_MASK);
++}
++
++bool mpp_grf_is_changed(struct mpp_grf_info *grf_info)
++{
++	bool changed = false;
++
++	if (grf_info && grf_info->grf && grf_info->val) {
++		u32 grf_status = mpp_get_grf(grf_info);
++		u32 grf_val = grf_info->val & MPP_GRF_VAL_MASK;
++
++		changed = (grf_status == grf_val) ? false : true;
++	}
++
++	return changed;
++}
++
++int mpp_set_grf(struct mpp_grf_info *grf_info)
++{
++	if (grf_info && grf_info->grf && grf_info->val)
++		regmap_write(grf_info->grf, grf_info->offset, grf_info->val);
++
++	return 0;
++}
++
++int mpp_time_record(struct mpp_task *task)
++{
++	if (mpp_debug_unlikely(DEBUG_TIMING) && task) {
++		task->start = ktime_get();
++		task->part = task->start;
++	}
++
++	return 0;
++}
++
++int mpp_time_part_diff(struct mpp_task *task)
++{
++	if (mpp_debug_unlikely(DEBUG_TIMING)) {
++		ktime_t end;
++		struct mpp_dev *mpp = mpp_get_task_used_device(task, task->session);
++
++		end = ktime_get();
++		mpp_debug(DEBUG_PART_TIMING, "%s:%d session %d:%d part time: %lld us\n",
++			dev_name(mpp->dev), task->core_id, task->session->pid,
++			task->session->index, ktime_us_delta(end, task->part));
++		task->part = end;
++	}
++
++	return 0;
++}
++
++int mpp_time_diff(struct mpp_task *task)
++{
++	if (mpp_debug_unlikely(DEBUG_TIMING)) {
++		ktime_t end;
++		struct mpp_dev *mpp = mpp_get_task_used_device(task, task->session);
++
++		end = ktime_get();
++		mpp_debug(DEBUG_TIMING, "%s:%d session %d:%d time: %lld us\n",
++			dev_name(mpp->dev), task->core_id, task->session->pid,
++			task->session->index, ktime_us_delta(end, task->start));
++	}
++
++	return 0;
++}
++
++int mpp_time_diff_with_hw_time(struct mpp_task *task, u32 clk_hz)
++{
++	if (mpp_debug_unlikely(DEBUG_TIMING)) {
++		ktime_t end;
++		struct mpp_dev *mpp = mpp_get_task_used_device(task, task->session);
++
++		end = ktime_get();
++
++		if (clk_hz)
++			mpp_debug(DEBUG_TIMING, "%s:%d session %d:%d time: %lld us hw %d us\n",
++				dev_name(mpp->dev), task->core_id, task->session->pid,
++				task->session->index, ktime_us_delta(end, task->start),
++				task->hw_cycles / (clk_hz / 1000000));
++		else
++			mpp_debug(DEBUG_TIMING, "%s:%d session %d:%d time: %lld us\n",
++				dev_name(mpp->dev), task->core_id, task->session->pid,
++				task->session->index, ktime_us_delta(end, task->start));
++	}
++
++	return 0;
++}
++
++#define LOG_TIMING(state, id, stage, time, base) \
++	do { \
++		if (test_bit(id, &state)) \
++			pr_info("timing: %-14s : %lld us\n", stage, ktime_us_delta(time, base)); \
++		else \
++			pr_info("timing: %-14s : invalid\n", stage); \
++	} while (0)
++
++void mpp_task_dump_timing(struct mpp_task *task, s64 time_diff)
++{
++	ktime_t s = task->on_create;
++	unsigned long state = task->state;
++
++	pr_info("task %d dump timing at %lld us:", task->task_id, time_diff);
++
++	pr_info("timing: %-14s : %lld us\n", "create", ktime_to_us(s));
++	LOG_TIMING(state, TASK_TIMING_CREATE_END, "create end",     task->on_create_end, s);
++	LOG_TIMING(state, TASK_TIMING_PENDING,    "pending",        task->on_pending, s);
++	LOG_TIMING(state, TASK_TIMING_RUN,        "run",            task->on_run, s);
++	LOG_TIMING(state, TASK_TIMING_TO_SCHED,   "timeout start",  task->on_sched_timeout, s);
++	LOG_TIMING(state, TASK_TIMING_RUN_END,    "run end",        task->on_run_end, s);
++	LOG_TIMING(state, TASK_TIMING_IRQ,        "irq",            task->on_irq, s);
++	LOG_TIMING(state, TASK_TIMING_TO_CANCEL,  "timeout cancel", task->on_cancel_timeout, s);
++	LOG_TIMING(state, TASK_TIMING_FINISH,     "finish",         task->on_finish, s);
++}
++
++int mpp_write_req(struct mpp_dev *mpp, u32 *regs,
++		  u32 start_idx, u32 end_idx, u32 en_idx)
++{
++	int i;
++
++	for (i = start_idx; i < end_idx; i++) {
++		if (i == en_idx)
++			continue;
++		mpp_write_relaxed(mpp, i * sizeof(u32), regs[i]);
++	}
++
++	return 0;
++}
++
++int mpp_read_req(struct mpp_dev *mpp, u32 *regs,
++		 u32 start_idx, u32 end_idx)
++{
++	int i;
++
++	for (i = start_idx; i < end_idx; i++)
++		regs[i] = mpp_read_relaxed(mpp, i * sizeof(u32));
++
++	return 0;
++}
++
++int mpp_get_clk_info(struct mpp_dev *mpp,
++		     struct mpp_clk_info *clk_info,
++		     const char *name)
++{
++	int index = of_property_match_string(mpp->dev->of_node,
++					     "clock-names", name);
++
++	if (index < 0)
++		return -EINVAL;
++
++	clk_info->clk = devm_clk_get(mpp->dev, name);
++	of_property_read_u32_index(mpp->dev->of_node,
++				   "rockchip,normal-rates",
++				   index,
++				   &clk_info->normal_rate_hz);
++	of_property_read_u32_index(mpp->dev->of_node,
++				   "rockchip,advanced-rates",
++				   index,
++				   &clk_info->advanced_rate_hz);
++
++	return 0;
++}
++
++int mpp_set_clk_info_rate_hz(struct mpp_clk_info *clk_info,
++			     enum MPP_CLOCK_MODE mode,
++			     unsigned long val)
++{
++	if (!clk_info->clk || !val)
++		return 0;
++
++	switch (mode) {
++	case CLK_MODE_DEBUG:
++		clk_info->debug_rate_hz = val;
++	break;
++	case CLK_MODE_REDUCE:
++		clk_info->reduce_rate_hz = val;
++	break;
++	case CLK_MODE_NORMAL:
++		clk_info->normal_rate_hz = val;
++	break;
++	case CLK_MODE_ADVANCED:
++		clk_info->advanced_rate_hz = val;
++	break;
++	case CLK_MODE_DEFAULT:
++		clk_info->default_rate_hz = val;
++	break;
++	default:
++		mpp_err("error mode %d\n", mode);
++	break;
++	}
++
++	return 0;
++}
++
++#define MPP_REDUCE_RATE_HZ (50 * MHZ)
++
++unsigned long mpp_get_clk_info_rate_hz(struct mpp_clk_info *clk_info,
++				       enum MPP_CLOCK_MODE mode)
++{
++	unsigned long clk_rate_hz = 0;
++
++	if (!clk_info->clk)
++		return 0;
++
++	if (clk_info->debug_rate_hz)
++		return clk_info->debug_rate_hz;
++
++	switch (mode) {
++	case CLK_MODE_REDUCE: {
++		if (clk_info->reduce_rate_hz)
++			clk_rate_hz = clk_info->reduce_rate_hz;
++		else
++			clk_rate_hz = MPP_REDUCE_RATE_HZ;
++	} break;
++	case CLK_MODE_NORMAL: {
++		if (clk_info->normal_rate_hz)
++			clk_rate_hz = clk_info->normal_rate_hz;
++		else
++			clk_rate_hz = clk_info->default_rate_hz;
++	} break;
++	case CLK_MODE_ADVANCED: {
++		if (clk_info->advanced_rate_hz)
++			clk_rate_hz = clk_info->advanced_rate_hz;
++		else if (clk_info->normal_rate_hz)
++			clk_rate_hz = clk_info->normal_rate_hz;
++		else
++			clk_rate_hz = clk_info->default_rate_hz;
++	} break;
++	case CLK_MODE_DEFAULT:
++	default: {
++		clk_rate_hz = clk_info->default_rate_hz;
++	} break;
++	}
++
++	return clk_rate_hz;
++}
++
++int mpp_clk_set_rate(struct mpp_clk_info *clk_info,
++		     enum MPP_CLOCK_MODE mode)
++{
++	unsigned long clk_rate_hz;
++
++	if (!clk_info->clk)
++		return -EINVAL;
++
++	clk_rate_hz = mpp_get_clk_info_rate_hz(clk_info, mode);
++	if (clk_rate_hz) {
++		clk_info->used_rate_hz = clk_rate_hz;
++		clk_set_rate(clk_info->clk, clk_rate_hz);
++		clk_info->real_rate_hz = clk_get_rate(clk_info->clk);
++	}
++
++	return 0;
++}
++
++static int __maybe_unused mpp_common_runtime_suspend(struct device *dev)
++{
++	struct mpp_dev *mpp = dev_get_drvdata(dev);
++
++	mpp_dev_load_clear(mpp);
++
++	return 0;
++}
++
++static int __maybe_unused mpp_common_runtime_resume(struct device *dev)
++{
++	return 0;
++}
++
++const struct dev_pm_ops mpp_common_pm_ops = {
++	SET_RUNTIME_PM_OPS(mpp_common_runtime_suspend, mpp_common_runtime_resume, NULL)
++	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
++};
++
++#ifdef CONFIG_ROCKCHIP_MPP_PROC_FS
++static int fops_show_u32(struct seq_file *file, void *v)
++{
++	u32 *val = file->private;
++
++	seq_printf(file, "%d\n", *val);
++
++	return 0;
++}
++
++static int fops_open_u32(struct inode *inode, struct file *file)
++{
++	return single_open(file, fops_show_u32, pde_data(inode));
++}
++
++static ssize_t fops_write_u32(struct file *file, const char __user *buf,
++			      size_t count, loff_t *ppos)
++{
++	int rc;
++	struct seq_file *priv = file->private_data;
++
++	rc = kstrtou32_from_user(buf, count, 0, priv->private);
++	if (rc)
++		return rc;
++
++	return count;
++}
++
++static const struct proc_ops procfs_fops_u32 = {
++	.proc_open = fops_open_u32,
++	.proc_read = seq_read,
++	.proc_release = single_release,
++	.proc_write = fops_write_u32,
++};
++
++struct proc_dir_entry *
++mpp_procfs_create_u32(const char *name, umode_t mode,
++		      struct proc_dir_entry *parent, void *data)
++{
++	return proc_create_data(name, mode, parent, &procfs_fops_u32, data);
++}
++
++void mpp_procfs_create_common(struct proc_dir_entry *parent, struct mpp_dev *mpp)
++{
++	mpp_procfs_create_u32("disable_work", 0644, parent, &mpp->disable);
++	mpp_procfs_create_u32("timing_check", 0644, parent, &mpp->timing_check);
++}
++#endif
+diff --git a/drivers/media/platform/rockchip/mpp/mpp_common.h b/drivers/media/platform/rockchip/mpp/mpp_common.h
+new file mode 100644
+index 000000000000..1fd707b48849
+--- /dev/null
++++ b/drivers/media/platform/rockchip/mpp/mpp_common.h
+@@ -0,0 +1,877 @@
++/* SPDX-License-Identifier: (GPL-2.0+ OR MIT) */
++/*
++ * Copyright (c) 2019 Fuzhou Rockchip Electronics Co., Ltd
++ *
++ * author:
++ *	Alpha Lin, alpha.lin@rock-chips.com
++ *	Randy Li, randy.li@rock-chips.com
++ *	Ding Wei, leo.ding@rock-chips.com
++ *
++ */
++#ifndef __ROCKCHIP_MPP_COMMON_H__
++#define __ROCKCHIP_MPP_COMMON_H__
++
++#include <linux/cdev.h>
++#include <linux/clk.h>
++#include <linux/dma-buf.h>
++#include <linux/kfifo.h>
++#include <linux/types.h>
++#include <linux/time.h>
++#include <linux/workqueue.h>
++#include <linux/kthread.h>
++#include <linux/reset.h>
++#include <linux/irqreturn.h>
++#include <linux/poll.h>
++#include <linux/platform_device.h>
++#include <soc/rockchip/pm_domains.h>
++#include <uapi/linux/rk-mpp.h>
++
++#define MHZ				(1000 * 1000)
++#define MPP_WORK_TIMEOUT_DELAY		(500)
++
++#define MPP_MAX_MSG_NUM			(16)
++#define MPP_MAX_REG_TRANS_NUM		(80)
++#define MPP_MAX_TASK_CAPACITY		(16)
++
++/* grf mask for get value */
++#define MPP_GRF_VAL_MASK		(0xFFFF)
++
++/* max 4 cores supported */
++#define MPP_MAX_CORE_NUM		(4)
++
++/**
++ * Device type: classified by hardware feature
++ */
++enum MPP_DEVICE_TYPE {
++	MPP_DEVICE_VDPU1	= 0, /* 0x00000001 */
++	MPP_DEVICE_VDPU2	= 1, /* 0x00000002 */
++	MPP_DEVICE_VDPU1_PP	= 2, /* 0x00000004 */
++	MPP_DEVICE_VDPU2_PP	= 3, /* 0x00000008 */
++	MPP_DEVICE_AV1DEC	= 4, /* 0x00000010 */
++
++	MPP_DEVICE_HEVC_DEC	= 8, /* 0x00000100 */
++	MPP_DEVICE_RKVDEC	= 9, /* 0x00000200 */
++	MPP_DEVICE_AVSPLUS_DEC	= 12, /* 0x00001000 */
++	MPP_DEVICE_RKJPEGD	= 13, /* 0x00002000 */
++
++	MPP_DEVICE_RKVENC	= 16, /* 0x00010000 */
++	MPP_DEVICE_VEPU1	= 17, /* 0x00020000 */
++	MPP_DEVICE_VEPU2	= 18, /* 0x00040000 */
++	MPP_DEVICE_VEPU2_JPEG	= 19, /* 0x00080000 */
++	MPP_DEVICE_RKJPEGE	= 20, /* 0x00100000 */
++	MPP_DEVICE_VEPU22	= 24, /* 0x01000000 */
++
++	MPP_DEVICE_IEP2		= 28, /* 0x10000000 */
++	MPP_DEVICE_VDPP		= 29, /* 0x20000000 */
++	MPP_DEVICE_BUTT,
++};
++
++/**
++ * Driver type: classified by driver
++ */
++enum MPP_DRIVER_TYPE {
++	MPP_DRIVER_NULL = 0,
++	MPP_DRIVER_VDPU1,
++	MPP_DRIVER_VEPU1,
++	MPP_DRIVER_VDPU2,
++	MPP_DRIVER_VEPU2,
++	MPP_DRIVER_VEPU22,
++	MPP_DRIVER_RKVDEC,
++	MPP_DRIVER_RKVENC,
++	MPP_DRIVER_IEP,
++	MPP_DRIVER_IEP2,
++	MPP_DRIVER_JPGDEC,
++	MPP_DRIVER_RKVDEC2,
++	MPP_DRIVER_RKVENC2,
++	MPP_DRIVER_AV1DEC,
++	MPP_DRIVER_VDPP,
++	MPP_DRIVER_JPGENC,
++	MPP_DRIVER_BUTT,
++};
++
++enum MPP_CLOCK_MODE {
++	CLK_MODE_BASE		= 0,
++	CLK_MODE_DEFAULT	= CLK_MODE_BASE,
++	CLK_MODE_DEBUG,
++	CLK_MODE_REDUCE,
++	CLK_MODE_NORMAL,
++	CLK_MODE_ADVANCED,
++	CLK_MODE_BUTT,
++};
++
++enum MPP_RESET_TYPE {
++	RST_TYPE_BASE		= 0,
++	RST_TYPE_A		= RST_TYPE_BASE,
++	RST_TYPE_H,
++	RST_TYPE_NIU_A,
++	RST_TYPE_NIU_H,
++	RST_TYPE_CORE,
++	RST_TYPE_CABAC,
++	RST_TYPE_HEVC_CABAC,
++	RST_TYPE_BUTT,
++};
++
++enum ENC_INFO_TYPE {
++	ENC_INFO_BASE		= 0,
++	ENC_INFO_WIDTH,
++	ENC_INFO_HEIGHT,
++	ENC_INFO_FORMAT,
++	ENC_INFO_FPS_IN,
++	ENC_INFO_FPS_OUT,
++	ENC_INFO_RC_MODE,
++	ENC_INFO_BITRATE,
++	ENC_INFO_GOP_SIZE,
++	ENC_INFO_FPS_CALC,
++	ENC_INFO_PROFILE,
++
++	ENC_INFO_BUTT,
++};
++
++enum DEC_INFO_TYPE {
++	DEC_INFO_BASE		= 0,
++	DEC_INFO_WIDTH,
++	DEC_INFO_HEIGHT,
++	DEC_INFO_FORMAT,
++	DEC_INFO_BITDEPTH,
++	DEC_INFO_FPS,
++
++	DEC_INFO_BUTT,
++};
++
++enum CODEC_INFO_FLAGS {
++	CODEC_INFO_FLAG_NULL	= 0,
++	CODEC_INFO_FLAG_NUMBER,
++	CODEC_INFO_FLAG_STRING,
++
++	CODEC_INFO_FLAG_BUTT,
++};
++
++struct mpp_task;
++struct mpp_session;
++struct mpp_dma_session;
++struct mpp_taskqueue;
++struct iommu_domain;
++
++/* struct use to collect task set and poll message */
++struct mpp_task_msgs {
++	/* for ioctl msgs bat process */
++	struct list_head list;
++	struct list_head list_session;
++
++	struct mpp_session *session;
++	struct mpp_taskqueue *queue;
++	struct mpp_task *task;
++	struct mpp_dev *mpp;
++
++	/* for fd reference */
++	int ext_fd;
++	struct fd f;
++
++	u32 flags;
++	u32 req_cnt;
++	u32 set_cnt;
++	u32 poll_cnt;
++
++	struct mpp_request reqs[MPP_MAX_MSG_NUM];
++	struct mpp_request *poll_req;
++};
++
++struct mpp_grf_info {
++	u32 offset;
++	u32 val;
++	struct regmap *grf;
++};
++
++/**
++ * struct for hardware info
++ */
++struct mpp_hw_info {
++	/* register number */
++	u32 reg_num;
++	/* hardware id */
++	int reg_id;
++	u32 hw_id;
++	/* start index of register */
++	u32 reg_start;
++	/* end index of register */
++	u32 reg_end;
++	/* register of enable hardware */
++	int reg_en;
++	/* register of codec format */
++	int reg_fmt;
++	u32 reg_ret_status;
++	void *link_info;
++	u32 magic_base;
++};
++
++struct mpp_trans_info {
++	const int count;
++	const u16 * const table;
++};
++
++struct reg_offset_elem {
++	u32 index;
++	u32 offset;
++};
++
++struct reg_offset_info {
++	u32 cnt;
++	struct reg_offset_elem elem[MPP_MAX_REG_TRANS_NUM];
++};
++
++struct codec_info_elem {
++	__u32 type;
++	__u32 flag;
++	__u64 data;
++};
++
++struct mpp_clk_info {
++	struct clk *clk;
++
++	/* debug rate, from debug */
++	u32 debug_rate_hz;
++	/* normal rate, from dtsi */
++	u32 normal_rate_hz;
++	/* high performance rate, from dtsi */
++	u32 advanced_rate_hz;
++
++	u32 default_rate_hz;
++	u32 reduce_rate_hz;
++	/* record last used rate */
++	u32 used_rate_hz;
++	u32 real_rate_hz;
++};
++
++struct mpp_dev_var {
++	enum MPP_DEVICE_TYPE device_type;
++
++	/* info for each hardware */
++	struct mpp_hw_info *hw_info;
++	struct mpp_trans_info *trans_info;
++	struct mpp_hw_ops *hw_ops;
++	struct mpp_dev_ops *dev_ops;
++};
++
++struct mpp_mem_region {
++	struct list_head reg_link;
++	/* address for iommu */
++	dma_addr_t iova;
++	unsigned long len;
++	u32 reg_idx;
++	void *hdl;
++	int fd;
++	/* whether is dup import entity */
++	bool is_dup;
++};
++
++struct mpp_load_info {
++	s64 busy_time;
++	s64 hw_busy_time;
++	ktime_t load_time;
++	u32 load;
++	u32 load_frac;
++	u32 utilization;
++	u32 utilization_frac;
++};
++
++struct mpp_dev {
++	struct device *dev;
++	const struct mpp_dev_var *var;
++	struct mpp_hw_ops *hw_ops;
++	struct mpp_dev_ops *dev_ops;
++
++	/* per-device work for attached taskqueue */
++	struct kthread_work work;
++	/* the flag for get/get/reduce freq */
++	bool auto_freq_en;
++	/* the flag for pmu idle request before device reset */
++	bool skip_idle;
++
++	/*
++	 * The task capacity is the task queue length that hardware can accept.
++	 * Default 1 means normal hardware can only accept one task at once.
++	 */
++	u32 task_capacity;
++	/*
++	 * The message capacity is the max message parallel process capacity.
++	 * Default 1 means normal hardware can only accept one message at one
++	 * shot ioctl.
++	 * Multi-core hardware can accept more message at one shot ioctl.
++	 */
++	u32 msgs_cap;
++
++	int irq;
++	bool is_irq_startup;
++	u32 irq_status;
++
++	void __iomem *reg_base;
++	struct mpp_grf_info *grf_info;
++	struct mpp_iommu_info *iommu_info;
++	int (*fault_handler)(struct iommu_domain *iommu, struct device *iommu_dev,
++			     unsigned long iova, int status, void *arg);
++	resource_size_t io_base;
++
++	atomic_t reset_request;
++	atomic_t session_index;
++	atomic_t task_count;
++	atomic_t task_index;
++	/* current task in running */
++	struct mpp_task *cur_task;
++	/* set session max buffers */
++	u32 session_max_buffers;
++	struct mpp_taskqueue *queue;
++	struct mpp_reset_group *reset_group;
++	/* point to MPP Service */
++	struct mpp_service *srv;
++
++	/* multi-core data */
++	struct list_head queue_link;
++	s32 core_id;
++
++	/* common per-device procfs */
++	u32 disable;
++	u32 timing_check;
++	u32 load_en;
++	struct mpp_load_info load_info;
++};
++
++struct mpp_session {
++	enum MPP_DEVICE_TYPE device_type;
++	u32 index;
++	/* the session related device private data */
++	struct mpp_service *srv;
++	struct mpp_dev *mpp;
++	struct mpp_dma_session *dma;
++
++	/* lock for session task pending list */
++	struct mutex pending_lock;
++	/* task pending list in session */
++	struct list_head pending_list;
++
++	pid_t pid;
++	atomic_t task_count;
++	atomic_t release_request;
++	/* trans info set by user */
++	int trans_count;
++	u16 trans_table[MPP_MAX_REG_TRANS_NUM];
++	u32 msg_flags;
++	/* link to mpp_service session_list */
++	struct list_head service_link;
++	/* link to mpp_workqueue session_attach / session_detach */
++	struct list_head session_link;
++	/* private data */
++	void *priv;
++
++	/*
++	 * session handler from mpp_dev_ops
++	 * process_task - handle messages of sending task
++	 * wait_result  - handle messages of polling task
++	 * deinit	- handle session deinit
++	 */
++	int (*process_task)(struct mpp_session *session,
++			    struct mpp_task_msgs *msgs);
++	int (*wait_result)(struct mpp_session *session,
++			   struct mpp_task_msgs *msgs);
++	void (*deinit)(struct mpp_session *session);
++
++	/* max message count */
++	int msgs_cnt;
++	struct list_head list_msgs;
++	struct list_head list_msgs_idle;
++	spinlock_t lock_msgs;
++};
++
++/* task state in work thread */
++enum mpp_task_state {
++	TASK_STATE_PENDING	= 0,
++	TASK_STATE_RUNNING	= 1,
++	TASK_STATE_START	= 2,
++	TASK_STATE_HANDLE	= 3,
++	TASK_STATE_IRQ		= 4,
++	TASK_STATE_FINISH	= 5,
++	TASK_STATE_TIMEOUT	= 6,
++	TASK_STATE_DONE		= 7,
++
++	TASK_STATE_PREPARE	= 8,
++	TASK_STATE_ABORT	= 9,
++	TASK_STATE_ABORT_READY	= 10,
++	TASK_STATE_PROC_DONE	= 11,
++
++	/* timing debug state */
++	TASK_TIMING_CREATE	= 16,
++	TASK_TIMING_CREATE_END	= 17,
++	TASK_TIMING_PENDING	= 18,
++	TASK_TIMING_RUN		= 19,
++	TASK_TIMING_TO_SCHED	= 20,
++	TASK_TIMING_RUN_END	= 21,
++	TASK_TIMING_IRQ		= 22,
++	TASK_TIMING_TO_CANCEL	= 23,
++	TASK_TIMING_FINISH	= 24,
++};
++
++/* The context for the a task */
++struct mpp_task {
++	/* context belong to */
++	struct mpp_session *session;
++
++	/* link to pending list in session */
++	struct list_head pending_link;
++	/* link to done list in session */
++	struct list_head done_link;
++	/* link to list in taskqueue */
++	struct list_head queue_link;
++	/* The DMA buffer used in this task */
++	struct list_head mem_region_list;
++	u32 mem_count;
++	struct mpp_mem_region mem_regions[MPP_MAX_REG_TRANS_NUM];
++
++	/* state in the taskqueue */
++	unsigned long state;
++	atomic_t abort_request;
++	/* delayed work for hardware timeout */
++	struct delayed_work timeout_work;
++	struct kref ref;
++
++	/* record context running start time */
++	ktime_t start;
++	ktime_t part;
++
++	/* debug timing */
++	ktime_t on_create;
++	ktime_t on_create_end;
++	ktime_t on_pending;
++	ktime_t on_run;
++	ktime_t on_sched_timeout;
++	ktime_t on_run_end;
++	ktime_t on_irq;
++	ktime_t on_cancel_timeout;
++	ktime_t on_finish;
++
++	/* hardware info for current task */
++	struct mpp_hw_info *hw_info;
++	u32 task_index;
++	u32 task_id;
++	u32 *reg;
++	u32 irq_status;
++	/* event for session wait thread */
++	wait_queue_head_t wait;
++
++	/* for multi-core */
++	struct mpp_dev *mpp;
++	s32 core_id;
++	/* hw cycles */
++	u32 hw_cycles;
++	u32 hw_time;
++};
++
++struct mpp_taskqueue {
++	/* kworker for attached taskqueue */
++	struct kthread_worker worker;
++	/* task for work queue */
++	struct task_struct *kworker_task;
++
++	/* lock for session attach and session_detach */
++	struct mutex session_lock;
++	/* link to session session_link for attached sessions */
++	struct list_head session_attach;
++	/* link to session session_link for detached sessions */
++	struct list_head session_detach;
++	atomic_t detach_count;
++
++	atomic_t task_id;
++	/* lock for pending list */
++	struct mutex pending_lock;
++	struct list_head pending_list;
++	/* lock for running list */
++	spinlock_t running_lock;
++	struct list_head running_list;
++
++	/* point to MPP Service */
++	struct mpp_service *srv;
++	/* lock for mmu list */
++	struct mutex mmu_lock;
++	struct list_head mmu_list;
++	/* lock for dev list */
++	struct mutex dev_lock;
++	struct list_head dev_list;
++	/*
++	 * task_capacity in taskqueue is the minimum task capacity of the
++	 * device task capacity which is attached to the taskqueue
++	 */
++	u32 task_capacity;
++
++	/* multi-core task distribution */
++	atomic_t reset_request;
++	struct mpp_dev *cores[MPP_MAX_CORE_NUM];
++	unsigned long core_idle;
++	u32 core_id_max;
++	u32 core_count;
++	unsigned long dev_active_flags;
++
++	/* for devices which share iommu, record last attach device */
++	struct mpp_iommu_info *last_iommu_info;
++};
++
++struct mpp_reset_group {
++	/* the flag for whether use rw_sem */
++	u32 rw_sem_on;
++	struct rw_semaphore rw_sem;
++	struct reset_control *resets[RST_TYPE_BUTT];
++	/* for set rw_sem */
++	struct mpp_taskqueue *queue;
++};
++
++struct mpp_service {
++	struct class *cls;
++	struct device *dev;
++	dev_t dev_id;
++	struct cdev mpp_cdev;
++	struct device *child_dev;
++#ifdef CONFIG_ROCKCHIP_MPP_PROC_FS
++	struct proc_dir_entry *procfs;
++#endif
++	unsigned long hw_support;
++	atomic_t shutdown_request;
++	/* follows for device probe */
++	struct mpp_grf_info grf_infos[MPP_DRIVER_BUTT];
++	struct platform_driver *sub_drivers[MPP_DRIVER_BUTT];
++	/* follows for attach service */
++	struct mpp_dev *sub_devices[MPP_DEVICE_BUTT];
++	u32 taskqueue_cnt;
++	struct mpp_taskqueue *task_queues[MPP_DEVICE_BUTT];
++	u32 reset_group_cnt;
++	struct mpp_reset_group *reset_groups[MPP_DEVICE_BUTT];
++
++	/* lock for session list */
++	struct mutex session_lock;
++	struct list_head session_list;
++	u32 session_count;
++
++	/* global timing record flag */
++	u32 timing_en;
++	u32 load_interval;
++
++	/* bit mask for iommu shared */
++	u32 iommu_shared_mask;
++};
++
++/*
++ * struct mpp_hw_ops - context specific operations for device
++ * @init	Do something when hardware probe.
++ * @exit	Do something when hardware remove.
++ * @clk_on	Enable clocks.
++ * @clk_off	Disable clocks.
++ * @get_freq	Get special freq for setting.
++ * @set_freq	Set freq to hardware.
++ * @reduce_freq	Reduce freq when hardware is not running.
++ * @reset	When error, reset hardware.
++ * @hack_run	Hack run for some soc
++ */
++struct mpp_hw_ops {
++	int (*init)(struct mpp_dev *mpp);
++	int (*exit)(struct mpp_dev *mpp);
++	int (*clk_on)(struct mpp_dev *mpp);
++	int (*clk_off)(struct mpp_dev *mpp);
++	int (*get_freq)(struct mpp_dev *mpp,
++			struct mpp_task *mpp_task);
++	int (*set_freq)(struct mpp_dev *mpp,
++			struct mpp_task *mpp_task);
++	int (*reduce_freq)(struct mpp_dev *mpp);
++	int (*reset)(struct mpp_dev *mpp);
++	int (*set_grf)(struct mpp_dev *mpp);
++	int (*hack_run)(struct mpp_dev *mpp);
++};
++
++/*
++ * struct mpp_dev_ops - context specific operations for task
++ * @alloc_task	Alloc and set task.
++ * @prepare	Check HW status for determining run next task or not.
++ * @run		Start a single {en,de}coding run. Set registers to hardware.
++ * @irq		Deal with hardware interrupt top-half.
++ * @isr		Deal with hardware interrupt bottom-half.
++ * @finish	Read back processing results and additional data from hardware.
++ * @result	Read status to userspace.
++ * @free_task	Release the resource allocate which alloc.
++ * @ioctl	Special cammand from userspace.
++ * @init_session extra initialization on session init.
++ * @free_session extra cleanup on session deinit.
++ * @dump_session information dump for session.
++ * @dump_dev    information dump for hardware device.
++ */
++struct mpp_dev_ops {
++	int (*process_task)(struct mpp_session *session,
++			    struct mpp_task_msgs *msgs);
++	int (*wait_result)(struct mpp_session *session,
++			   struct mpp_task_msgs *msgs);
++	void (*deinit)(struct mpp_session *session);
++	void (*task_worker)(struct kthread_work *work_s);
++
++	void *(*alloc_task)(struct mpp_session *session,
++			    struct mpp_task_msgs *msgs);
++	void *(*prepare)(struct mpp_dev *mpp, struct mpp_task *task);
++	int (*run)(struct mpp_dev *mpp, struct mpp_task *task);
++	int (*irq)(struct mpp_dev *mpp);
++	int (*isr)(struct mpp_dev *mpp);
++	int (*finish)(struct mpp_dev *mpp, struct mpp_task *task);
++	int (*result)(struct mpp_dev *mpp, struct mpp_task *task,
++		      struct mpp_task_msgs *msgs);
++	int (*free_task)(struct mpp_session *session,
++			 struct mpp_task *task);
++	int (*ioctl)(struct mpp_session *session, struct mpp_request *req);
++	int (*init_session)(struct mpp_session *session);
++	int (*free_session)(struct mpp_session *session);
++	int (*dump_session)(struct mpp_session *session, struct seq_file *seq);
++	int (*dump_dev)(struct mpp_dev *mpp);
++	int (*link_irq)(struct mpp_dev *mpp);
++};
++
++struct mpp_taskqueue *mpp_taskqueue_init(struct device *dev);
++
++struct mpp_mem_region *
++mpp_task_attach_fd(struct mpp_task *task, int fd);
++int mpp_translate_reg_address(struct mpp_session *session,
++			      struct mpp_task *task, int fmt,
++			      u32 *reg, struct reg_offset_info *off_inf);
++
++int mpp_check_req(struct mpp_request *req, int base,
++		  int max_size, u32 off_s, u32 off_e);
++int mpp_extract_reg_offset_info(struct reg_offset_info *off_inf,
++				struct mpp_request *req);
++int mpp_query_reg_offset_info(struct reg_offset_info *off_inf,
++			      u32 index);
++int mpp_translate_reg_offset_info(struct mpp_task *task,
++				  struct reg_offset_info *off_inf,
++				  u32 *reg);
++int mpp_task_init(struct mpp_session *session,
++		  struct mpp_task *task);
++int mpp_task_finish(struct mpp_session *session,
++		    struct mpp_task *task);
++void mpp_task_run_begin(struct mpp_task *task, u32 timing_en, u32 timeout);
++void mpp_task_run_end(struct mpp_task *task, u32 timing_en);
++int mpp_task_finalize(struct mpp_session *session,
++		      struct mpp_task *task);
++int mpp_task_dump_mem_region(struct mpp_dev *mpp,
++			     struct mpp_task *task);
++int mpp_task_dump_reg(struct mpp_dev *mpp,
++		      struct mpp_task *task);
++int mpp_task_dump_hw_reg(struct mpp_dev *mpp);
++void mpp_task_dump_timing(struct mpp_task *task, s64 time_diff);
++
++void mpp_reg_show(struct mpp_dev *mpp, u32 offset);
++void mpp_reg_show_range(struct mpp_dev *mpp, u32 start, u32 end);
++void mpp_free_task(struct kref *ref);
++
++void mpp_session_deinit(struct mpp_session *session);
++void mpp_session_cleanup_detach(struct mpp_taskqueue *queue,
++				struct kthread_work *work);
++
++int mpp_taskqueue_pending_to_run(struct mpp_taskqueue *queue, struct mpp_task *task);
++
++int mpp_dev_probe(struct mpp_dev *mpp,
++		  struct platform_device *pdev);
++int mpp_dev_remove(struct mpp_dev *mpp);
++void mpp_dev_shutdown(struct platform_device *pdev);
++int mpp_dev_register_srv(struct mpp_dev *mpp, struct mpp_service *srv);
++
++int mpp_power_on(struct mpp_dev *mpp);
++int mpp_power_off(struct mpp_dev *mpp);
++int mpp_dev_reset(struct mpp_dev *mpp);
++
++irqreturn_t mpp_dev_irq(int irq, void *param);
++
++struct reset_control *mpp_reset_control_get(struct mpp_dev *mpp,
++					    enum MPP_RESET_TYPE type,
++					    const char *name);
++
++u32 mpp_get_grf(struct mpp_grf_info *grf_info);
++bool mpp_grf_is_changed(struct mpp_grf_info *grf_info);
++int mpp_set_grf(struct mpp_grf_info *grf_info);
++
++int mpp_time_record(struct mpp_task *task);
++int mpp_time_diff(struct mpp_task *task);
++int mpp_time_diff_with_hw_time(struct mpp_task *task, u32 clk_hz);
++int mpp_time_part_diff(struct mpp_task *task);
++
++int mpp_write_req(struct mpp_dev *mpp, u32 *regs,
++		  u32 start_idx, u32 end_idx, u32 en_idx);
++int mpp_read_req(struct mpp_dev *mpp, u32 *regs,
++		 u32 start_idx, u32 end_idx);
++
++int mpp_get_clk_info(struct mpp_dev *mpp,
++		     struct mpp_clk_info *clk_info,
++		     const char *name);
++int mpp_set_clk_info_rate_hz(struct mpp_clk_info *clk_info,
++			     enum MPP_CLOCK_MODE mode,
++			     unsigned long val);
++unsigned long mpp_get_clk_info_rate_hz(struct mpp_clk_info *clk_info,
++				       enum MPP_CLOCK_MODE mode);
++int mpp_clk_set_rate(struct mpp_clk_info *clk_info,
++		     enum MPP_CLOCK_MODE mode);
++void mpp_dev_load(struct mpp_dev *mpp, struct mpp_task *mpp_task);
++void mpp_dev_load_clear(struct mpp_dev *mpp);
++
++static inline int mpp_write(struct mpp_dev *mpp, u32 reg, u32 val)
++{
++	int idx = reg / sizeof(u32);
++
++	mpp_debug(DEBUG_SET_REG,
++		  "write reg[%03d]: %04x: 0x%08x\n", idx, reg, val);
++	writel(val, mpp->reg_base + reg);
++
++	return 0;
++}
++
++static inline int mpp_write_relaxed(struct mpp_dev *mpp, u32 reg, u32 val)
++{
++	int idx = reg / sizeof(u32);
++
++	mpp_debug(DEBUG_SET_REG,
++		  "write reg[%03d]: %04x: 0x%08x\n", idx, reg, val);
++	writel_relaxed(val, mpp->reg_base + reg);
++
++	return 0;
++}
++
++static inline u32 mpp_read(struct mpp_dev *mpp, u32 reg)
++{
++	u32 val = 0;
++	int idx = reg / sizeof(u32);
++
++	val = readl(mpp->reg_base + reg);
++	mpp_debug(DEBUG_GET_REG,
++		  "read reg[%03d]: %04x: 0x%08x\n", idx, reg, val);
++
++	return val;
++}
++
++static inline u32 mpp_read_relaxed(struct mpp_dev *mpp, u32 reg)
++{
++	u32 val = 0;
++	int idx = reg / sizeof(u32);
++
++	val = readl_relaxed(mpp->reg_base + reg);
++	mpp_debug(DEBUG_GET_REG,
++		  "read reg[%03d] %04x: 0x%08x\n", idx, reg, val);
++
++	return val;
++}
++
++static inline int mpp_safe_reset(struct reset_control *rst)
++{
++	if (rst)
++		reset_control_assert(rst);
++
++	return 0;
++}
++
++static inline int mpp_safe_unreset(struct reset_control *rst)
++{
++	if (rst)
++		reset_control_deassert(rst);
++
++	return 0;
++}
++
++static inline int mpp_clk_safe_enable(struct clk *clk)
++{
++	if (clk)
++		clk_prepare_enable(clk);
++
++	return 0;
++}
++
++static inline int mpp_clk_safe_disable(struct clk *clk)
++{
++	if (clk)
++		clk_disable_unprepare(clk);
++
++	return 0;
++}
++
++static inline int mpp_reset_down_read(struct mpp_reset_group *group)
++{
++	if (group && group->rw_sem_on)
++		down_read(&group->rw_sem);
++
++	return 0;
++}
++
++static inline int mpp_reset_up_read(struct mpp_reset_group *group)
++{
++	if (group && group->rw_sem_on)
++		up_read(&group->rw_sem);
++
++	return 0;
++}
++
++static inline int mpp_reset_down_write(struct mpp_reset_group *group)
++{
++	if (group && group->rw_sem_on)
++		down_write(&group->rw_sem);
++
++	return 0;
++}
++
++static inline int mpp_reset_up_write(struct mpp_reset_group *group)
++{
++	if (group && group->rw_sem_on)
++		up_write(&group->rw_sem);
++
++	return 0;
++}
++
++static inline int mpp_pmu_idle_request(struct mpp_dev *mpp, bool idle)
++{
++	/* Runtime PM owns the modern Rockchip power-domain transition. */
++	return 0;
++}
++
++static inline struct mpp_dev *
++mpp_get_task_used_device(const struct mpp_task *task,
++			 const struct mpp_session *session)
++{
++	return task->mpp ? task->mpp : session->mpp;
++}
++
++#ifdef CONFIG_ROCKCHIP_MPP_PROC_FS
++struct proc_dir_entry *
++mpp_procfs_create_u32(const char *name, umode_t mode,
++		      struct proc_dir_entry *parent, void *data);
++void mpp_procfs_create_common(struct proc_dir_entry *parent, struct mpp_dev *mpp);
++#else
++static inline struct proc_dir_entry *
++mpp_procfs_create_u32(const char *name, umode_t mode,
++		      struct proc_dir_entry *parent, void *data)
++{
++	return 0;
++}
++static inline void mpp_procfs_create_common(struct proc_dir_entry *parent, struct mpp_dev *mpp)
++{
++}
++#endif
++
++#ifdef CONFIG_ROCKCHIP_MPP_PROC_FS
++extern const char *mpp_device_name[MPP_DEVICE_BUTT];
++extern const char *enc_info_item_name[ENC_INFO_BUTT];
++#endif
++
++extern const struct file_operations rockchip_mpp_fops;
++
++extern struct platform_driver rockchip_rkvdec_driver;
++extern struct platform_driver rockchip_rkvenc_driver;
++extern struct platform_driver rockchip_vdpu1_driver;
++extern struct platform_driver rockchip_vepu1_driver;
++extern struct platform_driver rockchip_vdpu2_driver;
++extern struct platform_driver rockchip_vepu2_driver;
++extern struct platform_driver rockchip_vepu22_driver;
++extern struct platform_driver rockchip_iep2_driver;
++extern struct platform_driver rockchip_jpgdec_driver;
++extern struct platform_driver rockchip_rkvdec2_driver;
++extern struct platform_driver rockchip_rkvenc2_driver;
++extern struct platform_driver rockchip_av1dec_driver;
++extern struct platform_driver rockchip_jpgenc_driver;
++extern struct platform_driver rockchip_vdpp_driver;
++
++extern const struct dev_pm_ops mpp_common_pm_ops;
++
++#endif
+diff --git a/drivers/media/platform/rockchip/mpp/mpp_debug.h b/drivers/media/platform/rockchip/mpp/mpp_debug.h
+new file mode 100644
+index 000000000000..4108c69da894
+--- /dev/null
++++ b/drivers/media/platform/rockchip/mpp/mpp_debug.h
+@@ -0,0 +1,138 @@
++/* SPDX-License-Identifier: (GPL-2.0+ OR MIT) */
++/*
++ * Copyright (c) 2019 Fuzhou Rockchip Electronics Co., Ltd
++ *
++ * author:
++ *	Alpha Lin, alpha.lin@rock-chips.com
++ *	Randy Li, randy.li@rock-chips.com
++ *	Ding Wei, leo.ding@rock-chips.com
++ *
++ */
++#ifndef __ROCKCHIP_MPP_DEBUG_H__
++#define __ROCKCHIP_MPP_DEBUG_H__
++
++#include <linux/types.h>
++
++/*
++ * debug flag usage:
++ * +------+-------------------+
++ * | 8bit |      24bit        |
++ * +------+-------------------+
++ *  0~23 bit is for different information type
++ * 24~31 bit is for information print format
++ */
++
++#define DEBUG_POWER				0x00000001
++#define DEBUG_CLOCK				0x00000002
++#define DEBUG_IRQ_STATUS			0x00000004
++#define DEBUG_IOMMU				0x00000008
++#define DEBUG_IOCTL				0x00000010
++#define DEBUG_FUNCTION				0x00000020
++#define DEBUG_REGISTER				0x00000040
++#define DEBUG_EXTRA_INFO			0x00000080
++#define DEBUG_TIMING				0x00000100
++#define DEBUG_TASK_INFO				0x00000200
++#define DEBUG_DUMP_ERR_REG			0x00000400
++#define DEBUG_LINK_TABLE			0x00000800
++
++#define DEBUG_SET_REG				0x00001000
++#define DEBUG_GET_REG				0x00002000
++#define DEBUG_PPS_FILL				0x00004000
++#define DEBUG_IRQ_CHECK				0x00008000
++#define DEBUG_CACHE_32B				0x00010000
++
++#define DEBUG_RESET				0x00020000
++#define DEBUG_SET_REG_L2			0x00040000
++#define DEBUG_GET_REG_L2			0x00080000
++#define DEBUG_GET_PERF_VAL			0x00100000
++#define DEBUG_SRAM_INFO				0x00200000
++
++#define DEBUG_SESSION				0x00400000
++#define DEBUG_DEVICE				0x00800000
++
++#define DEBUG_CCU				0x01000000
++#define DEBUG_CORE				0x02000000
++
++#define PRINT_FUNCTION				0x80000000
++#define PRINT_LINE				0x40000000
++
++/* reuse old debug bit flag */
++#define DEBUG_PART_TIMING			0x00000080
++#define DEBUG_SLICE				0x00000002
++
++extern unsigned int mpp_dev_debug;
++
++#define mpp_debug_unlikely(type)				\
++		(unlikely(mpp_dev_debug & (type)))
++
++#define mpp_debug_func(type, fmt, args...)			\
++	do {							\
++		if (unlikely(mpp_dev_debug & (type))) {		\
++			pr_info("%s:%d: " fmt,			\
++				 __func__, __LINE__, ##args);	\
++		}						\
++	} while (0)
++#define mpp_debug(type, fmt, args...)				\
++	do {							\
++		if (unlikely(mpp_dev_debug & (type))) {		\
++			pr_info(fmt, ##args);			\
++		}						\
++	} while (0)
++
++#define mpp_debug_enter()					\
++	do {							\
++		if (unlikely(mpp_dev_debug & DEBUG_FUNCTION)) {	\
++			pr_info("%s:%d: enter\n",		\
++				 __func__, __LINE__);		\
++		}						\
++	} while (0)
++
++#define mpp_debug_leave()					\
++	do {							\
++		if (unlikely(mpp_dev_debug & DEBUG_FUNCTION)) {	\
++			pr_info("%s:%d: leave\n",		\
++				 __func__, __LINE__);		\
++		}						\
++	} while (0)
++
++#define mpp_err(fmt, args...)					\
++		pr_err("%s:%d: " fmt, __func__, __LINE__, ##args)
++
++#define mpp_dbg_link(fmt, args...)				\
++	do {							\
++		if (unlikely(mpp_dev_debug & DEBUG_LINK_TABLE)) {		\
++			pr_info("%s:%d: " fmt,			\
++				 __func__, __LINE__, ##args);	\
++		}						\
++	} while (0)
++
++#define mpp_dbg_session(fmt, args...)				\
++	do {							\
++		if (unlikely(mpp_dev_debug & DEBUG_SESSION)) {	\
++			pr_info(fmt, ##args);			\
++		}						\
++	} while (0)
++
++#define mpp_dbg_ccu(fmt, args...)				\
++	do {							\
++		if (unlikely(mpp_dev_debug & DEBUG_CCU)) {	\
++			pr_info("%s:%d: " fmt,			\
++				 __func__, __LINE__, ##args);	\
++		}						\
++	} while (0)
++
++#define mpp_dbg_core(fmt, args...)				\
++	do {							\
++		if (unlikely(mpp_dev_debug & DEBUG_CORE)) {	\
++			pr_info(fmt, ##args);			\
++		}						\
++	} while (0)
++
++#define mpp_dbg_slice(fmt, args...)				\
++	do {							\
++		if (unlikely(mpp_dev_debug & DEBUG_SLICE)) {	\
++			pr_info(fmt, ##args);			\
++		}						\
++	} while (0)
++
++#endif
+diff --git a/drivers/media/platform/rockchip/mpp/mpp_iommu.c b/drivers/media/platform/rockchip/mpp/mpp_iommu.c
+new file mode 100644
+index 000000000000..575705ccc71f
+--- /dev/null
++++ b/drivers/media/platform/rockchip/mpp/mpp_iommu.c
+@@ -0,0 +1,672 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++/*
++ * Copyright (c) 2019 Fuzhou Rockchip Electronics Co., Ltd
++ * author:
++ *	Alpha Lin, alpha.lin@rock-chips.com
++ *	Randy Li, randy.li@rock-chips.com
++ *	Ding Wei, leo.ding@rock-chips.com
++ *
++ */
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/iommu.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/kref.h>
++#include <linux/slab.h>
++#include <linux/pm_runtime.h>
++#include <linux/platform_device.h>
++
++#ifdef CONFIG_ARM_DMA_USE_IOMMU
++#include <asm/dma-iommu.h>
++#endif
++
++#include "mpp_debug.h"
++#include "mpp_iommu.h"
++#include "mpp_common.h"
++
++struct mpp_dma_buffer *
++mpp_dma_find_buffer_fd(struct mpp_dma_session *dma, int fd)
++{
++	struct dma_buf *dmabuf;
++	struct mpp_dma_buffer *out = NULL;
++	struct mpp_dma_buffer *buffer = NULL, *n;
++	int find = 0;
++
++	dmabuf = dma_buf_get(fd);
++	if (IS_ERR(dmabuf))
++		return NULL;
++
++	mutex_lock(&dma->list_mutex);
++	list_for_each_entry_safe(buffer, n,
++				 &dma->used_list, link) {
++		/*
++		 * fd may dup several and point the same dambuf.
++		 * thus, here should be distinguish with the dmabuf.
++		 */
++		if (buffer->dmabuf == dmabuf) {
++			out = buffer;
++			find = 1;
++			list_move_tail(&buffer->link, &buffer->dma->used_list);
++			break;
++		}
++	}
++	if (!find) {
++		list_for_each_entry_safe(buffer, n,
++					&dma->static_list, link) {
++			/*
++			 * fd may dup several and point the same dambuf.
++			 * thus, here should be distinguish with the dmabuf.
++			 */
++			if (buffer->dmabuf == dmabuf) {
++				out = buffer;
++				list_move_tail(&buffer->link, &buffer->dma->static_list);
++				break;
++			}
++		}
++	}
++
++	mutex_unlock(&dma->list_mutex);
++	dma_buf_put(dmabuf);
++
++	return out;
++}
++
++/* Release the buffer from the current list */
++static void mpp_dma_release_buffer(struct kref *ref)
++{
++	struct mpp_dma_buffer *buffer =
++		container_of(ref, struct mpp_dma_buffer, ref);
++
++	buffer->dma->buffer_count--;
++	list_move_tail(&buffer->link, &buffer->dma->unused_list);
++
++	dma_buf_unmap_attachment(buffer->attach, buffer->sgt, buffer->dir);
++	dma_buf_detach(buffer->dmabuf, buffer->attach);
++	dma_buf_put(buffer->dmabuf);
++	buffer->dma = NULL;
++	buffer->dmabuf = NULL;
++	buffer->attach = NULL;
++	buffer->sgt = NULL;
++	buffer->copy_sgt = NULL;
++	buffer->iova = 0;
++	buffer->size = 0;
++	buffer->vaddr = NULL;
++	buffer->last_used = 0;
++}
++
++/* Remove the oldest buffer when count more than the setting */
++static int
++mpp_dma_remove_extra_buffer(struct mpp_dma_session *dma)
++{
++	struct mpp_dma_buffer *n;
++	struct mpp_dma_buffer *removable = NULL, *buffer = NULL;
++
++	if (dma->buffer_count > dma->max_buffers) {
++		mutex_lock(&dma->list_mutex);
++		list_for_each_entry_safe(buffer, n,
++					 &dma->used_list,
++					 link) {
++			if (kref_read(&buffer->ref) == 1) {
++				removable = buffer;
++				break;
++			}
++		}
++		if (removable)
++			kref_put(&removable->ref, mpp_dma_release_buffer);
++		mutex_unlock(&dma->list_mutex);
++	}
++
++	return 0;
++}
++
++int mpp_dma_release(struct mpp_dma_session *dma,
++		    struct mpp_dma_buffer *buffer)
++{
++	mutex_lock(&dma->list_mutex);
++	kref_put(&buffer->ref, mpp_dma_release_buffer);
++	mutex_unlock(&dma->list_mutex);
++
++	return 0;
++}
++
++int mpp_dma_release_fd(struct mpp_dma_session *dma, int fd)
++{
++	struct device *dev = dma->dev;
++	struct mpp_dma_buffer *buffer = NULL;
++
++	buffer = mpp_dma_find_buffer_fd(dma, fd);
++	if (IS_ERR_OR_NULL(buffer)) {
++		dev_err(dev, "can not find %d buffer in list\n", fd);
++
++		return -EINVAL;
++	}
++
++	mutex_lock(&dma->list_mutex);
++	kref_put(&buffer->ref, mpp_dma_release_buffer);
++	mutex_unlock(&dma->list_mutex);
++
++	return 0;
++}
++
++struct mpp_dma_buffer *
++mpp_dma_alloc(struct device *dev, size_t size)
++{
++	size_t align_size;
++	dma_addr_t iova;
++	struct  mpp_dma_buffer *buffer;
++
++	buffer = kzalloc(sizeof(*buffer), GFP_KERNEL);
++	if (!buffer)
++		return NULL;
++
++	align_size = PAGE_ALIGN(size);
++	buffer->vaddr = dma_alloc_coherent(dev, align_size, &iova, GFP_KERNEL);
++	if (!buffer->vaddr)
++		goto fail_dma_alloc;
++
++	buffer->size = align_size;
++	buffer->iova = iova;
++	buffer->dev = dev;
++
++	return buffer;
++fail_dma_alloc:
++	kfree(buffer);
++	return NULL;
++}
++
++int mpp_dma_free(struct mpp_dma_buffer *buffer)
++{
++	dma_free_coherent(buffer->dev, buffer->size,
++			buffer->vaddr, buffer->iova);
++	buffer->vaddr = NULL;
++	buffer->iova = 0;
++	buffer->size = 0;
++	buffer->dev = NULL;
++	kfree(buffer);
++
++	return 0;
++}
++
++struct mpp_dma_buffer *mpp_dma_import_fd(struct mpp_iommu_info *iommu_info,
++					 struct mpp_dma_session *dma,
++					 int fd, int static_use)
++{
++	int ret = 0;
++	struct sg_table *sgt;
++	struct dma_buf *dmabuf;
++	struct mpp_dma_buffer *buffer;
++	struct dma_buf_attachment *attach;
++
++	if (!dma) {
++		mpp_err("dma session is null\n");
++		return ERR_PTR(-EINVAL);
++	}
++
++	/* remove the oldest before add buffer */
++	if (!IS_ENABLED(CONFIG_DMABUF_CACHE))
++		mpp_dma_remove_extra_buffer(dma);
++
++	/* Check whether in dma session */
++	buffer = mpp_dma_find_buffer_fd(dma, fd);
++	if (!IS_ERR_OR_NULL(buffer)) {
++		if (kref_get_unless_zero(&buffer->ref))
++			return buffer;
++		dev_dbg(dma->dev, "missing the fd %d\n", fd);
++	}
++
++	dmabuf = dma_buf_get(fd);
++	if (IS_ERR(dmabuf)) {
++		ret = PTR_ERR(dmabuf);
++		mpp_err("dma_buf_get fd %d failed(%d)\n", fd, ret);
++		return ERR_PTR(ret);
++	}
++	/* A new DMA buffer */
++	mutex_lock(&dma->list_mutex);
++	buffer = list_first_entry_or_null(&dma->unused_list,
++					   struct mpp_dma_buffer,
++					   link);
++	if (!buffer) {
++		ret = -ENOMEM;
++		mutex_unlock(&dma->list_mutex);
++		goto fail;
++	}
++	list_del_init(&buffer->link);
++	mutex_unlock(&dma->list_mutex);
++
++	buffer->dmabuf = dmabuf;
++	buffer->dir = DMA_BIDIRECTIONAL;
++
++	attach = dma_buf_attach(buffer->dmabuf, dma->dev);
++	if (IS_ERR(attach)) {
++		ret = PTR_ERR(attach);
++		mpp_err("dma_buf_attach fd %d failed(%d)\n", fd, ret);
++		goto fail_attach;
++	}
++
++	sgt = dma_buf_map_attachment(attach, buffer->dir);
++	if (IS_ERR(sgt)) {
++		ret = PTR_ERR(sgt);
++		mpp_err("dma_buf_map_attachment fd %d failed(%d)\n", fd, ret);
++		goto fail_map;
++	}
++	buffer->iova = sg_dma_address(sgt->sgl);
++	buffer->size = sg_dma_len(sgt->sgl);
++	buffer->attach = attach;
++	buffer->sgt = sgt;
++	buffer->dma = dma;
++
++	kref_init(&buffer->ref);
++
++	if (!static_use && !IS_ENABLED(CONFIG_DMABUF_CACHE))
++		/* Increase the reference for used outside the buffer pool */
++		kref_get(&buffer->ref);
++
++	mutex_lock(&dma->list_mutex);
++	dma->buffer_count++;
++	if (static_use)
++		list_add_tail(&buffer->link, &dma->static_list);
++	else
++		list_add_tail(&buffer->link, &dma->used_list);
++	mutex_unlock(&dma->list_mutex);
++
++	return buffer;
++
++fail_map:
++	dma_buf_detach(buffer->dmabuf, attach);
++fail_attach:
++	mutex_lock(&dma->list_mutex);
++	list_add_tail(&buffer->link, &dma->unused_list);
++	mutex_unlock(&dma->list_mutex);
++fail:
++	dma_buf_put(dmabuf);
++	return ERR_PTR(ret);
++}
++
++int mpp_dma_unmap_kernel(struct mpp_dma_session *dma,
++			 struct mpp_dma_buffer *buffer)
++{
++	struct iosys_map map = IOSYS_MAP_INIT_VADDR(buffer->vaddr);
++	struct dma_buf *dmabuf = buffer->dmabuf;
++
++	if (IS_ERR_OR_NULL(map.vaddr) ||
++	    IS_ERR_OR_NULL(dmabuf))
++		return -EINVAL;
++
++	dma_buf_vunmap(dmabuf, &map);
++	buffer->vaddr = NULL;
++
++	dma_buf_end_cpu_access(dmabuf, DMA_FROM_DEVICE);
++
++	return 0;
++}
++
++int mpp_dma_map_kernel(struct mpp_dma_session *dma,
++		       struct mpp_dma_buffer *buffer)
++{
++	int ret;
++	struct iosys_map map;
++	struct dma_buf *dmabuf = buffer->dmabuf;
++
++	if (IS_ERR_OR_NULL(dmabuf))
++		return -EINVAL;
++
++	ret = dma_buf_begin_cpu_access(dmabuf, DMA_FROM_DEVICE);
++	if (ret) {
++		dev_dbg(dma->dev, "can't access the dma buffer\n");
++		goto failed_access;
++	}
++
++	ret = dma_buf_vmap(dmabuf, &map);
++	if (ret) {
++		dev_dbg(dma->dev, "can't vmap the dma buffer\n");
++		goto failed_vmap;
++	}
++
++	buffer->vaddr = map.vaddr;
++
++	return 0;
++
++failed_vmap:
++	dma_buf_end_cpu_access(dmabuf, DMA_FROM_DEVICE);
++failed_access:
++
++	return ret;
++}
++
++int mpp_dma_session_destroy(struct mpp_dma_session *dma)
++{
++	struct mpp_dma_buffer *n, *buffer = NULL;
++
++	if (!dma)
++		return -EINVAL;
++
++	mutex_lock(&dma->list_mutex);
++	list_for_each_entry_safe(buffer, n,
++				 &dma->used_list,
++				 link) {
++		kref_put(&buffer->ref, mpp_dma_release_buffer);
++	}
++	list_for_each_entry_safe(buffer, n,
++				 &dma->static_list,
++				 link) {
++		kref_put(&buffer->ref, mpp_dma_release_buffer);
++	}
++	mutex_unlock(&dma->list_mutex);
++
++	kfree(dma);
++
++	return 0;
++}
++
++struct mpp_dma_session *
++mpp_dma_session_create(struct device *dev, u32 max_buffers)
++{
++	int i;
++	struct mpp_dma_session *dma = NULL;
++	struct mpp_dma_buffer *buffer = NULL;
++
++	dma = kzalloc(sizeof(*dma), GFP_KERNEL);
++	if (!dma)
++		return NULL;
++
++	mutex_init(&dma->list_mutex);
++	INIT_LIST_HEAD(&dma->unused_list);
++	INIT_LIST_HEAD(&dma->used_list);
++	INIT_LIST_HEAD(&dma->static_list);
++
++	if (max_buffers > MPP_SESSION_MAX_BUFFERS) {
++		mpp_debug(DEBUG_IOCTL, "session_max_buffer %d must less than %d\n",
++			  max_buffers, MPP_SESSION_MAX_BUFFERS);
++		dma->max_buffers = MPP_SESSION_MAX_BUFFERS;
++	} else {
++		dma->max_buffers = max_buffers;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(dma->dma_bufs); i++) {
++		buffer = &dma->dma_bufs[i];
++		buffer->dma = dma;
++		INIT_LIST_HEAD(&buffer->link);
++		list_add_tail(&buffer->link, &dma->unused_list);
++	}
++	dma->dev = dev;
++
++	return dma;
++}
++
++/*
++ * begin cpu access => for_cpu = true
++ * end cpu access => for_cpu = false
++ */
++void mpp_dma_buf_sync(struct mpp_dma_buffer *buffer, u32 offset, u32 length,
++		      enum dma_data_direction dir, bool for_cpu)
++{
++	struct device *dev = buffer->dma->dev;
++	struct sg_table *sgt = buffer->sgt;
++	struct scatterlist *sg = sgt->sgl;
++	dma_addr_t sg_dma_addr = sg_dma_address(sg);
++	unsigned int len = 0;
++	int i;
++
++	for_each_sgtable_sg(sgt, sg, i) {
++		unsigned int sg_offset, sg_left, size = 0;
++
++		len += sg->length;
++		if (len <= offset) {
++			sg_dma_addr += sg->length;
++			continue;
++		}
++
++		sg_left = len - offset;
++		sg_offset = sg->length - sg_left;
++
++		size = (length < sg_left) ? length : sg_left;
++
++		if (for_cpu)
++			dma_sync_single_range_for_cpu(dev, sg_dma_addr,
++						      sg_offset, size, dir);
++		else
++			dma_sync_single_range_for_device(dev, sg_dma_addr,
++							 sg_offset, size, dir);
++
++		offset += size;
++		length -= size;
++		sg_dma_addr += sg->length;
++
++		if (length == 0)
++			break;
++	}
++}
++
++int mpp_iommu_detach(struct mpp_iommu_info *info)
++{
++	if (!info)
++		return 0;
++
++	iommu_detach_group(info->domain, info->group);
++	return 0;
++}
++
++int mpp_iommu_attach(struct mpp_iommu_info *info)
++{
++	struct mpp_iommu_info *last_info;
++
++	if (!info)
++		return 0;
++
++	/* if device changed, detach last first */
++	last_info = info->queue->last_iommu_info;
++	if (info->shared && last_info && last_info->shared
++	    && (info->dev != last_info->dev)) {
++		iommu_detach_group(last_info->domain, last_info->group);
++	}
++	info->queue->last_iommu_info = info;
++
++	if (info->domain == iommu_get_domain_for_dev(info->dev))
++		return 0;
++
++	return iommu_attach_group(info->domain, info->group);
++}
++
++
++struct mpp_iommu_info *
++mpp_iommu_probe(struct device *dev)
++{
++	int ret = 0;
++	struct device_node *np = NULL;
++	struct platform_device *pdev = NULL;
++	struct mpp_iommu_info *info = NULL;
++	struct iommu_domain *domain = NULL;
++	struct iommu_group *group = NULL;
++#ifdef CONFIG_ARM_DMA_USE_IOMMU
++	struct dma_iommu_mapping *mapping;
++#endif
++	np = of_parse_phandle(dev->of_node, "iommus", 0);
++	if (!np || !of_device_is_available(np)) {
++		mpp_err("failed to get device node\n");
++		return ERR_PTR(-ENODEV);
++	}
++
++	pdev = of_find_device_by_node(np);
++	of_node_put(np);
++	if (!pdev) {
++		mpp_err("failed to get platform device\n");
++		return ERR_PTR(-ENODEV);
++	}
++
++	group = iommu_group_get(dev);
++	if (!group) {
++		ret = -EINVAL;
++		goto err_put_pdev;
++	}
++
++	/*
++	 * On arm32-arch, group->default_domain should be NULL,
++	 * domain store in mapping created by arm32-arch.
++	 * we re-attach domain here
++	 */
++#ifdef CONFIG_ARM_DMA_USE_IOMMU
++	if (!iommu_group_default_domain(group)) {
++		mapping = to_dma_iommu_mapping(dev);
++		WARN_ON(!mapping);
++		domain = mapping->domain;
++	}
++#endif
++	if (!domain) {
++		domain = iommu_get_domain_for_dev(dev);
++		if (!domain) {
++			ret = -EINVAL;
++			goto err_put_group;
++		}
++	}
++
++	info = devm_kzalloc(dev, sizeof(*info), GFP_KERNEL);
++	if (!info) {
++		ret = -ENOMEM;
++		goto err_put_group;
++	}
++
++	init_rwsem(&info->rw_sem_self);
++	info->rw_sem = &info->rw_sem_self;
++	spin_lock_init(&info->dev_lock);
++	info->dev = dev;
++	info->pdev = pdev;
++	info->group = group;
++	info->domain = domain;
++	info->dev_active = NULL;
++	info->irq = platform_get_irq(pdev, 0);
++	info->got_irq = (info->irq < 0) ? false : true;
++
++	/* get shared flag, if true detach */
++	if (IS_ENABLED(CONFIG_ARM_DMA_USE_IOMMU)) {
++		struct platform_driver *drv = to_platform_driver(dev->driver);
++
++		info->shared = drv->driver_managed_dma;
++		if (info->shared)
++			iommu_detach_group(info->domain, info->group);
++	}
++
++	return info;
++
++err_put_group:
++	if (group)
++		iommu_group_put(group);
++err_put_pdev:
++	if (pdev)
++		platform_device_put(pdev);
++
++	return ERR_PTR(ret);
++}
++
++int mpp_iommu_remove(struct mpp_iommu_info *info)
++{
++	if (!info)
++		return 0;
++
++	/* if iommu shared, ensure current device's domain, then remove correctly */
++	if (info->shared)
++		mpp_iommu_attach(info);
++
++	iommu_group_put(info->group);
++	platform_device_put(info->pdev);
++
++	return 0;
++}
++
++int mpp_iommu_refresh(struct mpp_iommu_info *info, struct device *dev)
++{
++	if (!info)
++		return 0;
++
++	/* Reattach the owned generic IOMMU domain after a hardware reset. */
++	mpp_iommu_detach(info);
++	return mpp_iommu_attach(info);
++}
++
++int mpp_iommu_flush_tlb(struct mpp_iommu_info *info)
++{
++	if (!info)
++		return 0;
++
++	if (info->domain && info->domain->ops)
++		iommu_flush_iotlb_all(info->domain);
++
++	return 0;
++}
++
++int mpp_iommu_dev_activate(struct mpp_iommu_info *info, struct mpp_dev *dev)
++{
++	unsigned long flags;
++	int ret = 0;
++
++	if (!info)
++		return 0;
++
++	spin_lock_irqsave(&info->dev_lock, flags);
++
++	if (info->dev_active || !dev) {
++		dev_err(info->dev, "can not activate %s -> %s\n",
++			info->dev_active ? dev_name(info->dev_active->dev) : NULL,
++			dev ? dev_name(dev->dev) : NULL);
++		ret = -EINVAL;
++	} else {
++		info->dev_active = dev;
++		/* The DMA IOVA cookie precludes a domain fault handler. */
++
++		dev_dbg(info->dev, "activate -> %p %s\n", dev, dev_name(dev->dev));
++	}
++
++	spin_unlock_irqrestore(&info->dev_lock, flags);
++
++	return ret;
++}
++
++int mpp_iommu_dev_deactivate(struct mpp_iommu_info *info, struct mpp_dev *dev)
++{
++	unsigned long flags;
++
++	if (!info)
++		return 0;
++
++	spin_lock_irqsave(&info->dev_lock, flags);
++
++	if (info->dev_active != dev)
++		dev_err(info->dev, "can not deactivate %s when %s activated\n",
++			dev_name(dev->dev),
++			info->dev_active ? dev_name(info->dev_active->dev) : NULL);
++
++	dev_dbg(info->dev, "deactivate %p\n", info->dev_active);
++	info->dev_active = NULL;
++	spin_unlock_irqrestore(&info->dev_lock, flags);
++
++	return 0;
++}
++
++int mpp_iommu_reserve_iova(struct mpp_iommu_info *info, dma_addr_t iova, size_t size)
++{
++
++	struct iommu_domain *domain;
++	struct mpp_iommu_dma_cookie *cookie;
++	struct iova_domain *iovad;
++	unsigned long pfn_lo, pfn_hi;
++
++	if (!info)
++		return 0;
++
++	domain = info->domain;
++	if (!domain || domain->cookie_type != IOMMU_COOKIE_DMA_IOVA ||
++	    !domain->iova_cookie)
++		return -EINVAL;
++
++	cookie = (struct mpp_iommu_dma_cookie *)domain->iova_cookie;
++	iovad = &cookie->iovad;
++
++	/* iova will be freed automatically by put_iova_domain() */
++	pfn_lo = iova_pfn(iovad, iova);
++	pfn_hi = iova_pfn(iovad, iova + size - 1);
++	if (!reserve_iova(iovad, pfn_lo, pfn_hi))
++		return -EINVAL;
++
++	return 0;
++
++}
+diff --git a/drivers/media/platform/rockchip/mpp/mpp_iommu.h b/drivers/media/platform/rockchip/mpp/mpp_iommu.h
+new file mode 100644
+index 000000000000..98caf7d3b58f
+--- /dev/null
++++ b/drivers/media/platform/rockchip/mpp/mpp_iommu.h
+@@ -0,0 +1,189 @@
++/* SPDX-License-Identifier: (GPL-2.0+ OR MIT) */
++/*
++ * Copyright (c) 2019 Fuzhou Rockchip Electronics Co., Ltd
++ *
++ * author:
++ *	Alpha Lin, alpha.lin@rock-chips.com
++ *	Randy Li, randy.li@rock-chips.com
++ *	Ding Wei, leo.ding@rock-chips.com
++ *
++ */
++#ifndef __ROCKCHIP_MPP_IOMMU_H__
++#define __ROCKCHIP_MPP_IOMMU_H__
++
++#include <linux/iommu.h>
++#include <linux/dma-mapping.h>
++#include <linux/interrupt.h>
++#include <linux/iova.h>
++
++/*
++ * Linux v6.18's private DMA cookie starts with iovad. Keep this prefix
++ * layout exact before reaching the allocator through domain->iova_cookie.
++ */
++struct mpp_iommu_dma_cookie {
++	struct iova_domain iovad;
++};
++
++struct mpp_dma_buffer {
++	/* link to dma session buffer list */
++	struct list_head link;
++
++	/* dma session belong */
++	struct mpp_dma_session *dma;
++	/* DMABUF information */
++	struct dma_buf *dmabuf;
++	struct dma_buf_attachment *attach;
++	struct sg_table *sgt;
++	struct sg_table *copy_sgt;
++	enum dma_data_direction dir;
++
++	dma_addr_t iova;
++	unsigned long size;
++	void *vaddr;
++
++	struct kref ref;
++	ktime_t last_used;
++	/* alloc by device */
++	struct device *dev;
++};
++
++#define MPP_SESSION_MAX_BUFFERS		60
++
++struct mpp_dma_session {
++	/* the buffer used in session */
++	struct list_head unused_list;
++	struct list_head used_list;
++	/*
++	 * For those buffer import by ioctl MPP_CMD_TRANS_FD_TO_IOVA,
++	 * move to static_list instead of used_list and don't increase extra kref,
++	 * so that it will release when user space call ioctl MPP_CMD_RELEASE_FD.
++	 */
++	struct list_head static_list;
++	struct mpp_dma_buffer dma_bufs[MPP_SESSION_MAX_BUFFERS];
++	/* the mutex for the above buffer list */
++	struct mutex list_mutex;
++	/* the max buffer num for the buffer list */
++	u32 max_buffers;
++	/* the count for the buffer list */
++	int buffer_count;
++
++	struct device *dev;
++};
++
++struct mpp_rk_iommu {
++	struct list_head link;
++	u32 grf_val;
++	int mmu_num;
++	u32 base_addr[2];
++	void __iomem *bases[2];
++	u32 dte_addr;
++	u32 is_paged;
++};
++
++struct mpp_dev;
++
++struct mpp_iommu_info {
++	struct rw_semaphore *rw_sem;
++	struct rw_semaphore rw_sem_self;
++
++	struct device *dev;
++	struct platform_device *pdev;
++	struct iommu_domain *domain;
++	struct iommu_group *group;
++	struct mpp_rk_iommu *iommu;
++	iommu_fault_handler_t hdl;
++
++	spinlock_t dev_lock;
++	struct mpp_dev *dev_active;
++
++	int irq;
++	int got_irq;
++	/* flag for mark iommu whether shared */
++	bool shared;
++	struct mpp_taskqueue *queue;
++};
++
++struct mpp_dma_session *
++mpp_dma_session_create(struct device *dev, u32 max_buffers);
++int mpp_dma_session_destroy(struct mpp_dma_session *dma);
++
++struct mpp_dma_buffer *
++mpp_dma_alloc(struct device *dev, size_t size);
++int mpp_dma_free(struct mpp_dma_buffer *buffer);
++
++struct mpp_dma_buffer *
++mpp_dma_import_fd(struct mpp_iommu_info *iommu_info,
++		  struct mpp_dma_session *dma, int fd, int static_use);
++int mpp_dma_release(struct mpp_dma_session *dma,
++		    struct mpp_dma_buffer *buffer);
++int mpp_dma_release_fd(struct mpp_dma_session *dma, int fd);
++
++int mpp_dma_unmap_kernel(struct mpp_dma_session *dma,
++			 struct mpp_dma_buffer *buffer);
++int mpp_dma_map_kernel(struct mpp_dma_session *dma,
++		       struct mpp_dma_buffer *buffer);
++struct mpp_dma_buffer *mpp_dma_find_buffer_fd(struct mpp_dma_session *dma, int fd);
++void mpp_dma_buf_sync(struct mpp_dma_buffer *buffer, u32 offset, u32 length,
++		      enum dma_data_direction dir, bool for_cpu);
++
++struct mpp_iommu_info *
++mpp_iommu_probe(struct device *dev);
++int mpp_iommu_remove(struct mpp_iommu_info *info);
++
++int mpp_iommu_attach(struct mpp_iommu_info *info);
++int mpp_iommu_detach(struct mpp_iommu_info *info);
++
++int mpp_iommu_refresh(struct mpp_iommu_info *info, struct device *dev);
++int mpp_iommu_flush_tlb(struct mpp_iommu_info *info);
++int mpp_av1_iommu_disable(struct device *dev);
++int mpp_av1_iommu_enable(struct device *dev);
++
++int mpp_iommu_dev_activate(struct mpp_iommu_info *info, struct mpp_dev *dev);
++int mpp_iommu_dev_deactivate(struct mpp_iommu_info *info, struct mpp_dev *dev);
++int mpp_iommu_reserve_iova(struct mpp_iommu_info *info, dma_addr_t iova, size_t size);
++
++static inline int mpp_iommu_down_read(struct mpp_iommu_info *info)
++{
++	if (info)
++		down_read(info->rw_sem);
++
++	return 0;
++}
++
++static inline int mpp_iommu_up_read(struct mpp_iommu_info *info)
++{
++	if (info)
++		up_read(info->rw_sem);
++
++	return 0;
++}
++
++static inline int mpp_iommu_down_write(struct mpp_iommu_info *info)
++{
++	if (info)
++		down_write(info->rw_sem);
++
++	return 0;
++}
++
++static inline int mpp_iommu_up_write(struct mpp_iommu_info *info)
++{
++	if (info)
++		up_write(info->rw_sem);
++
++	return 0;
++}
++
++static inline void mpp_iommu_enable_irq(struct mpp_iommu_info *info)
++{
++	if (info && info->got_irq)
++		enable_irq(info->irq);
++}
++
++static inline void mpp_iommu_disable_irq(struct mpp_iommu_info *info)
++{
++	if (info && info->got_irq)
++		disable_irq(info->irq);
++}
++
++#endif
+diff --git a/drivers/media/platform/rockchip/mpp/mpp_service.c b/drivers/media/platform/rockchip/mpp/mpp_service.c
+new file mode 100644
+index 000000000000..6f8f71b05a8e
+--- /dev/null
++++ b/drivers/media/platform/rockchip/mpp/mpp_service.c
+@@ -0,0 +1,551 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++/*
++ * Copyright (c) 2019 Fuzhou Rockchip Electronics Co., Ltd
++ *
++ * author:
++ *	Alpha Lin, alpha.lin@rock-chips.com
++ *	Randy Li, randy.li@rock-chips.com
++ *	Ding Wei, leo.ding@rock-chips.com
++ *
++ */
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/completion.h>
++#include <linux/delay.h>
++#include <linux/module.h>
++#include <linux/of_platform.h>
++#include <linux/proc_fs.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++#include <linux/nospec.h>
++#include <linux/mfd/syscon.h>
++
++#include "mpp_debug.h"
++#include "mpp_common.h"
++#include "mpp_iommu.h"
++
++#define MPP_CLASS_NAME		"mpp_class"
++#define MPP_SERVICE_NAME	"mpp_service"
++
++#define HAS_RKVDEC	IS_ENABLED(CONFIG_ROCKCHIP_MPP_RKVDEC)
++#define HAS_RKVENC	IS_ENABLED(CONFIG_ROCKCHIP_MPP_RKVENC)
++#define HAS_VDPU1	IS_ENABLED(CONFIG_ROCKCHIP_MPP_VDPU1)
++#define HAS_VEPU1	IS_ENABLED(CONFIG_ROCKCHIP_MPP_VEPU1)
++#define HAS_VDPU2	IS_ENABLED(CONFIG_ROCKCHIP_MPP_VDPU2)
++#define HAS_VEPU2	IS_ENABLED(CONFIG_ROCKCHIP_MPP_VEPU2)
++#define HAS_VEPU22	IS_ENABLED(CONFIG_ROCKCHIP_MPP_VEPU22)
++#define HAS_IEP2	IS_ENABLED(CONFIG_ROCKCHIP_MPP_IEP2)
++#define HAS_JPGDEC	IS_ENABLED(CONFIG_ROCKCHIP_MPP_JPGDEC)
++#define HAS_JPGENC	IS_ENABLED(CONFIG_ROCKCHIP_MPP_JPGENC)
++#define HAS_RKVDEC2	IS_ENABLED(CONFIG_ROCKCHIP_MPP_RKVDEC2)
++#define HAS_RKVENC2	IS_ENABLED(CONFIG_ROCKCHIP_MPP_RKVENC2)
++#define HAS_AV1DEC	IS_ENABLED(CONFIG_ROCKCHIP_MPP_AV1DEC)
++#define HAS_VDPP	IS_ENABLED(CONFIG_ROCKCHIP_MPP_VDPP)
++
++#define MPP_REGISTER_DRIVER(srv, flag, X, x) {\
++	if (flag)\
++		mpp_add_driver(srv, MPP_DRIVER_##X, &rockchip_##x##_driver, "grf_"#x);\
++	}
++
++unsigned int mpp_dev_debug;
++module_param(mpp_dev_debug, uint, 0644);
++MODULE_PARM_DESC(mpp_dev_debug, "bit switch for mpp debug information");
++
++static const char mpp_version[] = MPP_VERSION;
++
++static int mpp_init_grf(struct device_node *np,
++			struct mpp_grf_info *grf_info,
++			const char *grf_name)
++{
++	int ret;
++	int index;
++	u32 grf_offset = 0;
++	u32 grf_value = 0;
++	struct regmap *grf;
++
++	grf = syscon_regmap_lookup_by_phandle(np, "rockchip,grf");
++	if (IS_ERR_OR_NULL(grf))
++		return -EINVAL;
++
++	ret = of_property_read_u32(np, "rockchip,grf-offset", &grf_offset);
++	if (ret)
++		return -ENODATA;
++
++	index = of_property_match_string(np, "rockchip,grf-names", grf_name);
++	if (index < 0)
++		return -ENODATA;
++
++	ret = of_property_read_u32_index(np, "rockchip,grf-values",
++					 index, &grf_value);
++	if (ret)
++		return -ENODATA;
++
++	grf_info->grf = grf;
++	grf_info->offset = grf_offset;
++	grf_info->val = grf_value;
++
++	mpp_set_grf(grf_info);
++
++	return 0;
++}
++
++static int mpp_add_driver(struct mpp_service *srv,
++			  enum MPP_DRIVER_TYPE type,
++			  struct platform_driver *driver,
++			  const char *grf_name)
++{
++	int ret;
++
++	mpp_init_grf(srv->dev->of_node,
++		     &srv->grf_infos[type],
++		     grf_name);
++
++	if (IS_ENABLED(CONFIG_ARM_DMA_USE_IOMMU))
++		driver->driver_managed_dma = (srv->iommu_shared_mask & BIT(type)) ? true : false;
++
++	ret = platform_driver_register(driver);
++	if (ret)
++		return ret;
++
++	srv->sub_drivers[type] = driver;
++
++	return 0;
++}
++
++static int mpp_remove_driver(struct mpp_service *srv, int i)
++{
++	if (srv && srv->sub_drivers[i]) {
++		mpp_set_grf(&srv->grf_infos[i]);
++		platform_driver_unregister(srv->sub_drivers[i]);
++		srv->sub_drivers[i] = NULL;
++	}
++
++	return 0;
++}
++
++static int mpp_register_service(struct mpp_service *srv,
++				const char *service_name)
++{
++	int ret;
++	struct device *dev = srv->dev;
++
++	/* create a device */
++	ret = alloc_chrdev_region(&srv->dev_id, 0, 1, service_name);
++	if (ret) {
++		dev_err(dev, "alloc dev_t failed\n");
++		return ret;
++	}
++
++	cdev_init(&srv->mpp_cdev, &rockchip_mpp_fops);
++	srv->mpp_cdev.owner = THIS_MODULE;
++	srv->mpp_cdev.ops = &rockchip_mpp_fops;
++
++	ret = cdev_add(&srv->mpp_cdev, srv->dev_id, 1);
++	if (ret) {
++		unregister_chrdev_region(srv->dev_id, 1);
++		dev_err(dev, "add device failed\n");
++		return ret;
++	}
++
++	srv->child_dev = device_create(srv->cls, dev, srv->dev_id,
++				       NULL, "%s", service_name);
++
++	return 0;
++}
++
++static int mpp_remove_service(struct mpp_service *srv)
++{
++	device_destroy(srv->cls, srv->dev_id);
++	cdev_del(&srv->mpp_cdev);
++	unregister_chrdev_region(srv->dev_id, 1);
++
++	return 0;
++}
++
++#ifdef CONFIG_ROCKCHIP_MPP_PROC_FS
++static int mpp_procfs_remove(struct mpp_service *srv)
++{
++	if (srv->procfs) {
++		proc_remove(srv->procfs);
++		srv->procfs = NULL;
++	}
++
++	return 0;
++}
++
++static int mpp_show_version(struct seq_file *seq, void *offset)
++{
++	seq_printf(seq, "%s\n", mpp_version);
++
++	return 0;
++}
++
++static int mpp_dump_session(struct mpp_session *session, struct seq_file *s)
++{
++	struct mpp_dma_session *dma = session->dma;
++	struct mpp_dma_buffer *n;
++	struct mpp_dma_buffer *buffer;
++	phys_addr_t end;
++	unsigned long z = 0, t = 0;
++	int i = 0;
++#define K(size) ((unsigned long)((size) >> 10))
++
++	if (!dma)
++		return 0;
++
++	seq_puts(s, "session iova range dump:\n");
++
++	mutex_lock(&dma->list_mutex);
++	list_for_each_entry_safe(buffer, n, &dma->used_list, link) {
++		end = buffer->iova + buffer->size - 1;
++		z = (unsigned long)buffer->size;
++		t += z;
++
++		seq_printf(s, "%4d: ", i++);
++		seq_printf(s, "%pa..%pa (%10lu %s)\n", &buffer->iova, &end,
++			   (z >= 1024) ? (K(z)) : z,
++			   (z >= 1024) ? "KiB" : "Bytes");
++	}
++	i = 0;
++	list_for_each_entry_safe(buffer, n, &dma->unused_list, link) {
++		if (!buffer->dmabuf)
++			continue;
++
++		end = buffer->iova + buffer->size - 1;
++		z = (unsigned long)buffer->size;
++		t += z;
++
++		seq_printf(s, "%4d: ", i++);
++		seq_printf(s, "%pa..%pa (%10lu %s)\n", &buffer->iova, &end,
++			   (z >= 1024) ? (K(z)) : z,
++			   (z >= 1024) ? "KiB" : "Bytes");
++	}
++
++	mutex_unlock(&dma->list_mutex);
++	seq_printf(s, "session: pid=%d index=%d\n", session->pid, session->index);
++	seq_printf(s, " device: %s\n", dev_name(session->mpp->dev));
++	seq_printf(s, " memory: %lu MiB\n", K(K(t)));
++
++	return 0;
++}
++
++static int mpp_show_session_summary(struct seq_file *seq, void *offset)
++{
++	struct mpp_session *session = NULL, *n;
++	struct mpp_service *srv = seq->private;
++
++	mutex_lock(&srv->session_lock);
++	list_for_each_entry_safe(session, n,
++				 &srv->session_list,
++				 service_link) {
++		struct  mpp_dev *mpp;
++
++		if (!session->priv)
++			continue;
++
++		if (!session->mpp)
++			continue;
++		mpp = session->mpp;
++
++		mpp_dump_session(session, seq);
++
++		if (mpp->dev_ops->dump_session)
++			mpp->dev_ops->dump_session(session, seq);
++	}
++	mutex_unlock(&srv->session_lock);
++
++	return 0;
++}
++
++static int mpp_show_support_cmd(struct seq_file *file, void *v)
++{
++	seq_puts(file, "------------- SUPPORT CMD -------------\n");
++	seq_printf(file, "QUERY_HW_SUPPORT:     0x%08x\n", MPP_CMD_QUERY_HW_SUPPORT);
++	seq_printf(file, "QUERY_HW_ID:          0x%08x\n", MPP_CMD_QUERY_HW_ID);
++	seq_printf(file, "QUERY_CMD_SUPPORT:    0x%08x\n", MPP_CMD_QUERY_CMD_SUPPORT);
++	seq_printf(file, "QUERY_BUTT:           0x%08x\n", MPP_CMD_QUERY_BUTT);
++	seq_puts(file, "----\n");
++	seq_printf(file, "INIT_CLIENT_TYPE:     0x%08x\n", MPP_CMD_INIT_CLIENT_TYPE);
++	seq_printf(file, "INIT_TRANS_TABLE:     0x%08x\n", MPP_CMD_INIT_TRANS_TABLE);
++	seq_printf(file, "INIT_BUTT:            0x%08x\n", MPP_CMD_INIT_BUTT);
++	seq_puts(file, "----\n");
++	seq_printf(file, "SET_REG_WRITE:        0x%08x\n", MPP_CMD_SET_REG_WRITE);
++	seq_printf(file, "SET_REG_READ:         0x%08x\n", MPP_CMD_SET_REG_READ);
++	seq_printf(file, "SET_REG_ADDR_OFFSET:  0x%08x\n", MPP_CMD_SET_REG_ADDR_OFFSET);
++	seq_printf(file, "SEND_BUTT:            0x%08x\n", MPP_CMD_SEND_BUTT);
++	seq_puts(file, "----\n");
++	seq_printf(file, "POLL_HW_FINISH:       0x%08x\n", MPP_CMD_POLL_HW_FINISH);
++	seq_printf(file, "POLL_BUTT:            0x%08x\n", MPP_CMD_POLL_BUTT);
++	seq_puts(file, "----\n");
++	seq_printf(file, "RESET_SESSION:        0x%08x\n", MPP_CMD_RESET_SESSION);
++	seq_printf(file, "TRANS_FD_TO_IOVA:     0x%08x\n", MPP_CMD_TRANS_FD_TO_IOVA);
++	seq_printf(file, "RELEASE_FD:           0x%08x\n", MPP_CMD_RELEASE_FD);
++	seq_printf(file, "SEND_CODEC_INFO:      0x%08x\n", MPP_CMD_SEND_CODEC_INFO);
++	seq_printf(file, "CONTROL_BUTT:         0x%08x\n", MPP_CMD_CONTROL_BUTT);
++
++	return 0;
++}
++
++static int mpp_show_support_device(struct seq_file *file, void *v)
++{
++	u32 i;
++	struct mpp_service *srv = file->private;
++
++	seq_puts(file, "---- SUPPORT DEVICES ----\n");
++	for (i = 0; i < MPP_DEVICE_BUTT; i++) {
++		struct mpp_dev *mpp;
++		struct mpp_hw_info *hw_info;
++
++		if (test_bit(i, &srv->hw_support)) {
++			mpp = srv->sub_devices[array_index_nospec(i, MPP_DEVICE_BUTT)];
++			if (!mpp)
++				continue;
++
++			seq_printf(file, "DEVICE[%2d]:%-10s", i, mpp_device_name[i]);
++			hw_info = mpp->var->hw_info;
++			if (hw_info->hw_id)
++				seq_printf(file, "HW_ID:0x%08x", hw_info->hw_id);
++			seq_puts(file, "\n");
++		}
++	}
++
++	return 0;
++}
++
++static int mpp_show_device_load(struct seq_file *file, void *v)
++{
++	u32 i, j;
++	struct mpp_service *srv = file->private;
++
++	if (!srv->load_interval) {
++		seq_puts(file, "please set load_interval first!!!\n");
++		seq_puts(file, "e.g. set 1000ms to load_interval:\n");
++		seq_puts(file, "echo 1000 > /proc/mpp_service/load_interval\n");
++		return 0;
++	}
++
++	for (i = 0; i < MPP_DEVICE_BUTT; i++) {
++		struct mpp_taskqueue *queue = srv->task_queues[i];
++
++		if (!queue)
++			continue;
++
++		for (j = 0; j < MPP_MAX_CORE_NUM; j++) {
++			struct mpp_dev *mpp = queue->cores[j];
++
++			if (!mpp)
++				continue;
++
++			if (mpp->load_info.load_time) {
++				s64 time_diff_us;
++
++				time_diff_us = ktime_us_delta(ktime_get(),
++							      mpp->load_info.load_time);
++				if ((time_diff_us > 2 * srv->load_interval * 1000) ||
++				    list_empty(&queue->session_attach))
++					mpp_dev_load_clear(mpp);
++			}
++
++			seq_printf(file, "%-25s load: %3d.%02d%% utilization: %3d.%02d%%\n",
++				   dev_name(mpp->dev),
++				   mpp->load_info.load, mpp->load_info.load_frac,
++				   mpp->load_info.utilization, mpp->load_info.utilization_frac);
++		}
++	}
++
++	return 0;
++}
++
++static int mpp_procfs_init(struct mpp_service *srv)
++{
++	srv->procfs = proc_mkdir(MPP_SERVICE_NAME, NULL);
++	if (IS_ERR_OR_NULL(srv->procfs)) {
++		mpp_err("failed on mkdir /proc/%s\n", MPP_SERVICE_NAME);
++		srv->procfs = NULL;
++		return -EIO;
++	}
++	/* show version */
++	proc_create_single("version", 0444, srv->procfs, mpp_show_version);
++	/* for show session info */
++	proc_create_single_data("sessions-summary", 0444,
++				srv->procfs, mpp_show_session_summary, srv);
++	/* show support dev cmd */
++	proc_create_single("supports-cmd", 0444, srv->procfs, mpp_show_support_cmd);
++	/* show support devices */
++	proc_create_single_data("supports-device", 0444,
++				srv->procfs, mpp_show_support_device, srv);
++	srv->timing_en = 1;
++	mpp_procfs_create_u32("timing_en", 0644, srv->procfs, &srv->timing_en);
++	/* show per device load info */
++	proc_create_single_data("load", 0444, srv->procfs, mpp_show_device_load, srv);
++	srv->load_interval = 0;
++	mpp_procfs_create_u32("load_interval", 0644, srv->procfs, &srv->load_interval);
++
++	return 0;
++}
++#else
++static inline int mpp_procfs_remove(struct mpp_service *srv)
++{
++	return 0;
++}
++
++static inline int mpp_procfs_init(struct mpp_service *srv)
++{
++	return 0;
++}
++#endif
++
++static int mpp_service_probe(struct platform_device *pdev)
++{
++	int ret, i;
++	struct mpp_service *srv = NULL;
++	struct mpp_taskqueue *queue;
++	struct device *dev = &pdev->dev;
++	struct device_node *np = dev->of_node;
++
++	dev_info(dev, "%s\n", mpp_version);
++	dev_info(dev, "probe start\n");
++	srv = devm_kzalloc(dev, sizeof(*srv), GFP_KERNEL);
++	if (!srv)
++		return -ENOMEM;
++
++	srv->dev = dev;
++	atomic_set(&srv->shutdown_request, 0);
++	platform_set_drvdata(pdev, srv);
++
++	srv->cls = class_create(MPP_CLASS_NAME);
++	if (PTR_ERR_OR_ZERO(srv->cls))
++		return PTR_ERR(srv->cls);
++
++	of_property_read_u32(np, "rockchip,taskqueue-count",
++			     &srv->taskqueue_cnt);
++	if (srv->taskqueue_cnt > MPP_DEVICE_BUTT) {
++		dev_err(dev, "rockchip,taskqueue-count %d must less than %d\n",
++			srv->taskqueue_cnt, MPP_DEVICE_BUTT);
++		return -EINVAL;
++	}
++
++	for (i = 0; i < srv->taskqueue_cnt; i++) {
++		queue = mpp_taskqueue_init(dev);
++		if (!queue)
++			continue;
++
++		kthread_init_worker(&queue->worker);
++		queue->kworker_task = kthread_run(kthread_worker_fn, &queue->worker,
++						  "mpp_worker_%d", i);
++		srv->task_queues[i] = queue;
++	}
++
++	of_property_read_u32(np, "rockchip,resetgroup-count",
++			     &srv->reset_group_cnt);
++	if (srv->reset_group_cnt > MPP_DEVICE_BUTT) {
++		dev_err(dev, "rockchip,resetgroup-count %d must less than %d\n",
++			srv->reset_group_cnt, MPP_DEVICE_BUTT);
++		return -EINVAL;
++	}
++
++	if (srv->reset_group_cnt) {
++		u32 i = 0;
++		struct mpp_reset_group *group;
++
++		for (i = 0; i < srv->reset_group_cnt; i++) {
++			group = devm_kzalloc(dev, sizeof(*group), GFP_KERNEL);
++			if (!group)
++				continue;
++
++			init_rwsem(&group->rw_sem);
++			srv->reset_groups[i] = group;
++		}
++	}
++
++	of_property_read_u32(np, "rockchip,iommu-shared-mask",
++			     &srv->iommu_shared_mask);
++
++	ret = mpp_register_service(srv, MPP_SERVICE_NAME);
++	if (ret) {
++		dev_err(dev, "register %s device\n", MPP_SERVICE_NAME);
++		goto fail_register;
++	}
++	mutex_init(&srv->session_lock);
++	INIT_LIST_HEAD(&srv->session_list);
++	mpp_procfs_init(srv);
++
++	/* register sub drivers */
++	MPP_REGISTER_DRIVER(srv, HAS_RKVDEC, RKVDEC, rkvdec);
++	MPP_REGISTER_DRIVER(srv, HAS_RKVENC, RKVENC, rkvenc);
++	MPP_REGISTER_DRIVER(srv, HAS_VDPU1, VDPU1, vdpu1);
++	MPP_REGISTER_DRIVER(srv, HAS_VEPU1, VEPU1, vepu1);
++	MPP_REGISTER_DRIVER(srv, HAS_VDPU2, VDPU2, vdpu2);
++	MPP_REGISTER_DRIVER(srv, HAS_VEPU2, VEPU2, vepu2);
++	MPP_REGISTER_DRIVER(srv, HAS_VEPU22, VEPU22, vepu22);
++	MPP_REGISTER_DRIVER(srv, HAS_IEP2, IEP2, iep2);
++	MPP_REGISTER_DRIVER(srv, HAS_JPGDEC, JPGDEC, jpgdec);
++	MPP_REGISTER_DRIVER(srv, HAS_JPGENC, JPGENC, jpgenc);
++	MPP_REGISTER_DRIVER(srv, HAS_RKVDEC2, RKVDEC2, rkvdec2);
++	MPP_REGISTER_DRIVER(srv, HAS_RKVENC2, RKVENC2, rkvenc2);
++	MPP_REGISTER_DRIVER(srv, HAS_AV1DEC, AV1DEC, av1dec);
++	MPP_REGISTER_DRIVER(srv, HAS_VDPP, VDPP, vdpp);
++
++	dev_info(dev, "probe success\n");
++
++	return 0;
++
++fail_register:
++	class_destroy(srv->cls);
++
++	return ret;
++}
++
++static void mpp_service_remove(struct platform_device *pdev)
++{
++	struct mpp_taskqueue *queue;
++	struct device *dev = &pdev->dev;
++	struct mpp_service *srv = platform_get_drvdata(pdev);
++	int i;
++
++	dev_info(dev, "remove device\n");
++
++	for (i = 0; i < srv->taskqueue_cnt; i++) {
++		queue = srv->task_queues[i];
++		if (queue && queue->kworker_task) {
++			kthread_flush_worker(&queue->worker);
++			kthread_stop(queue->kworker_task);
++			queue->kworker_task = NULL;
++		}
++	}
++
++	/* remove sub drivers */
++	for (i = 0; i < MPP_DRIVER_BUTT; i++)
++		mpp_remove_driver(srv, i);
++
++	mpp_remove_service(srv);
++	class_destroy(srv->cls);
++	mpp_procfs_remove(srv);
++
++}
++
++static const struct of_device_id mpp_dt_ids[] = {
++	{
++		.compatible = "rockchip,mpp-service",
++	},
++	{ },
++};
++MODULE_DEVICE_TABLE(of, mpp_dt_ids);
++
++
++static struct platform_driver mpp_service_driver = {
++	.probe = mpp_service_probe,
++	.remove = mpp_service_remove,
++	.driver = {
++		.name = "mpp_service",
++		.of_match_table = of_match_ptr(mpp_dt_ids),
++	},
++};
++
++module_platform_driver(mpp_service_driver);
++
++MODULE_IMPORT_NS("DMA_BUF");
++MODULE_LICENSE("Dual MIT/GPL");
++MODULE_VERSION(MPP_VERSION);
++MODULE_AUTHOR("Ding Wei leo.ding@rock-chips.com");
++MODULE_DESCRIPTION("Rockchip mpp service driver");

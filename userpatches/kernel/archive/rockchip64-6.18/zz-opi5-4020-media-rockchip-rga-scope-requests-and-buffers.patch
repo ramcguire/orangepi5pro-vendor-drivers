@@ -1,0 +1,553 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: opi5 <noreply@example.invalid>
+Date: Sat, 14 Nov 2026 00:00:00 +0000
+Subject: [PATCH] media: rockchip: rga: scope requests and buffers
+
+Any process with /dev/rga could:
+- make the RGA access any memory: RGA_PHYSICAL_ADDRESS buffers, and legacy
+  uv_addr without mmu_flag, were used as given. Require CAP_SYS_RAWIO at
+  open; kernel callers keep access.
+- make the kernel use any address as a struct dma_buf: RGA_IOC_IMPORT_BUFFER
+  accepted RGA_DMA_BUFFER_PTR, whose memory is a kernel pointer meant for
+  in-kernel callers (rga_mpi_commit). Refuse it from userspace.
+- free a request in use: ids are global, and cancel, completion and exit
+  each dropped the id's reference. Cancel, config and submit now need the
+  caller's own request, and the id's reference is dropped once.
+- free a buffer in use: handles are global, release didn't count imports,
+  and exit kfree()d buffers that other clients or jobs held. Imports are
+  now per session and counted, release and exit drop only imports, and
+  jobs use only their own session's handles.
+---
+ .../rockchip/rga/rga3/include/rga_drv.h       | 13 +++
+ .../rockchip/rga/rga3/include/rga_job.h       |  3 +-
+ .../rockchip/rga/rga3/include/rga_mm.h        |  2 +-
+ .../platform/rockchip/rga/rga3/rga_drv.c      | 55 +++++++++---
+ .../platform/rockchip/rga/rga3/rga_job.c      | 31 +++++--
+ .../media/platform/rockchip/rga/rga3/rga_mm.c | 87 ++++++++++++++++---
+ 6 files changed, 158 insertions(+), 33 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/rga/rga3/include/rga_drv.h b/drivers/media/platform/rockchip/rga/rga3/include/rga_drv.h
+index 1e9cbd5bfdeb..72e2a4085bda 100644
+--- a/drivers/media/platform/rockchip/rga/rga3/include/rga_drv.h
++++ b/drivers/media/platform/rockchip/rga/rga3/include/rga_drv.h
+@@ -232,6 +232,11 @@ struct rga_internal_buffer {
+ 
+ 	struct kref refcount;
+ 	struct rga_session *session;
++	/*
++	 * opi5 (experimental): imports not yet released, under mm->lock.
++	 * Release drops only these, never the references jobs hold.
++	 */
++	int import_count;
+ 
+ 	/* The scheduler of the mapping */
+ 	struct rga_scheduler_t *scheduler;
+@@ -251,6 +256,12 @@ struct rga_session {
+ 	bool release;
+ 	struct rw_semaphore release_rwsem;
+ 	struct kref refcount;
++	/*
++	 * opi5 (experimental): may use physical addresses (the opener had
++	 * CAP_SYS_RAWIO, or a kernel caller).  RGA maps them as given, so
++	 * otherwise any client could make the RGA read or write any memory.
++	 */
++	bool allow_phys;
+ };
+ 
+ struct rga_job_buffer {
+@@ -399,6 +410,8 @@ struct rga_request {
+ 	uint8_t mpi_config_flags;
+ 	int id;
+ 	struct rga_session *session;
++	/* opi5 (experimental): the id's reference was dropped (cancel or exit) */
++	bool id_released;
+ 
+ 	spinlock_t lock;
+ 	struct kref refcount;
+diff --git a/drivers/media/platform/rockchip/rga/rga3/include/rga_job.h b/drivers/media/platform/rockchip/rga/rga3/include/rga_job.h
+index e63659bb0e8e..67d16649aaf4 100644
+--- a/drivers/media/platform/rockchip/rga/rga3/include/rga_job.h
++++ b/drivers/media/platform/rockchip/rga/rga3/include/rga_job.h
+@@ -44,7 +44,8 @@ void rga_request_get(struct rga_request *request);
+ int rga_request_free(struct rga_request *request);
+ int rga_request_alloc(uint32_t flags, struct rga_session *session);
+ 
+-struct rga_request *rga_request_config(struct rga_user_request *user_request);
++struct rga_request *rga_request_config(struct rga_user_request *user_request,
++				       struct rga_session *session);
+ struct rga_request *rga_request_kernel_config(struct rga_user_request *user_request);
+ int rga_request_submit(struct rga_request *request);
+ int rga_request_mpi_submit(struct rga_req *req, struct rga_request *request);
+diff --git a/drivers/media/platform/rockchip/rga/rga3/include/rga_mm.h b/drivers/media/platform/rockchip/rga/rga3/include/rga_mm.h
+index a75f2470b928..bddb05c9454b 100644
+--- a/drivers/media/platform/rockchip/rga/rga3/include/rga_mm.h
++++ b/drivers/media/platform/rockchip/rga/rga3/include/rga_mm.h
+@@ -58,7 +58,7 @@ void rga_mm_unmap_job_info(struct rga_job *job);
+ 
+ int rga_mm_import_buffer(struct rga_external_buffer *external_buffer,
+ 			 struct rga_session *session);
+-int rga_mm_release_buffer(uint32_t handle);
++int rga_mm_release_buffer(uint32_t handle, struct rga_session *session);
+ int rga_mm_session_release_buffer(struct rga_session *session);
+ 
+ int rga_mm_init(struct rga_mm **session);
+diff --git a/drivers/media/platform/rockchip/rga/rga3/rga_drv.c b/drivers/media/platform/rockchip/rga/rga3/rga_drv.c
+index cfcf8ecb0e84..eab44f0de8be 100644
+--- a/drivers/media/platform/rockchip/rga/rga3/rga_drv.c
++++ b/drivers/media/platform/rockchip/rga/rga3/rga_drv.c
+@@ -243,11 +243,11 @@ int rga_mpi_commit(struct rga_mpi_job_t *mpi_job)
+ 
+ err_put_request:
+ 	if ((mpi_job->dma_buf_src0 != NULL) && (mpi_cmd.src.yrgb_addr > 0))
+-		rga_mm_release_buffer(mpi_cmd.src.yrgb_addr);
++		rga_mm_release_buffer(mpi_cmd.src.yrgb_addr, request->session);
+ 	if ((mpi_job->dma_buf_src1 != NULL) && (mpi_cmd.pat.yrgb_addr > 0))
+-		rga_mm_release_buffer(mpi_cmd.pat.yrgb_addr);
++		rga_mm_release_buffer(mpi_cmd.pat.yrgb_addr, request->session);
+ 	if ((mpi_job->dma_buf_dst != NULL) && (mpi_cmd.dst.yrgb_addr > 0))
+-		rga_mm_release_buffer(mpi_cmd.dst.yrgb_addr);
++		rga_mm_release_buffer(mpi_cmd.dst.yrgb_addr, request->session);
+ 
+ err_release_rwsem:
+ 	up_read(&request->session->release_rwsem);
+@@ -272,6 +272,7 @@ int rga_kernel_commit(struct rga_req *cmd)
+ 	session = rga_session_init();
+ 	if (IS_ERR(session))
+ 		return PTR_ERR(session);
++	session->allow_phys = true;	/* opi5: kernel caller */
+ 
+ 	down_read(&session->release_rwsem);
+ 
+@@ -655,6 +656,20 @@ static long rga_ioctl_import_buffer(unsigned long arg, struct rga_session *sessi
+ 		goto err_free_external_buffer;
+ 	}
+ 
++	/*
++	 * opi5 (experimental): RGA_DMA_BUFFER_PTR's memory is a kernel
++	 * struct dma_buf pointer, for in-kernel callers (rga_mpi_commit).
++	 * From userspace it was attached and mapped as given.  Check every
++	 * buffer before importing any, so a refusal leaves nothing imported.
++	 */
++	for (i = 0; i < buffer_pool.size; i++) {
++		if (external_buffer[i].type == RGA_DMA_BUFFER_PTR) {
++			rga_err("buffer[%d] dma_buf pointer refused from userspace\n", i);
++			ret = -EINVAL;
++			goto err_free_external_buffer;
++		}
++	}
++
+ 	for (i = 0; i < buffer_pool.size; i++) {
+ 		if (DEBUGGER_EN(MSG)) {
+ 			rga_log("import buffer info:\n");
+@@ -688,7 +703,7 @@ static long rga_ioctl_import_buffer(unsigned long arg, struct rga_session *sessi
+ 	return ret;
+ }
+ 
+-static long rga_ioctl_release_buffer(unsigned long arg)
++static long rga_ioctl_release_buffer(unsigned long arg, struct rga_session *session)
+ {
+ 	int i;
+ 	int ret = 0;
+@@ -733,7 +748,7 @@ static long rga_ioctl_release_buffer(unsigned long arg)
+ 		if (DEBUGGER_EN(MSG))
+ 			rga_log("release buffer handle[%d]\n", external_buffer[i].handle);
+ 
+-		ret = rga_mm_release_buffer(external_buffer[i].handle);
++		ret = rga_mm_release_buffer(external_buffer[i].handle, session);
+ 		if (ret < 0) {
+ 			rga_err("buffer[%d] mm release buffer failed! handle = %d\n",
+ 			       i, external_buffer[i].handle);
+@@ -767,7 +782,8 @@ static long rga_ioctl_request_create(unsigned long arg, struct rga_session *sess
+ 	return 0;
+ }
+ 
+-static long rga_ioctl_request_submit(unsigned long arg, bool run_enbale)
++static long rga_ioctl_request_submit(unsigned long arg, bool run_enbale,
++				     struct rga_session *session)
+ {
+ 	int ret = 0;
+ 	struct rga_pending_request_manager *request_manager = NULL;
+@@ -792,7 +808,7 @@ static long rga_ioctl_request_submit(unsigned long arg, bool run_enbale)
+ 	if (DEBUGGER_EN(MSG))
+ 		rga_log("config request id = %d", user_request.id);
+ 
+-	request = rga_request_config(&user_request);
++	request = rga_request_config(&user_request, session);
+ 	if (IS_ERR_OR_NULL(request)) {
+ 		rga_err("request[%d] config failed!\n", user_request.id);
+ 		return -EFAULT;
+@@ -822,7 +838,7 @@ static long rga_ioctl_request_submit(unsigned long arg, bool run_enbale)
+ 	return 0;
+ }
+ 
+-static long rga_ioctl_request_cancel(unsigned long arg)
++static long rga_ioctl_request_cancel(unsigned long arg, struct rga_session *session)
+ {
+ 	uint32_t id;
+ 	struct rga_pending_request_manager *request_manager;
+@@ -851,6 +867,17 @@ static long rga_ioctl_request_cancel(unsigned long arg)
+ 		return -EINVAL;
+ 	}
+ 
++	/*
++	 * opi5 (experimental): cancel drops the id's reference.  Another
++	 * session's cancel, a second cancel, or a cancel before exit (which
++	 * drops it again) freed a request a job still used.
++	 */
++	if (request->session != session || request->id_released) {
++		rga_err("request id[%d] is not this session's to cancel", id);
++		mutex_unlock(&request_manager->lock);
++		return -EINVAL;
++	}
++	request->id_released = true;
+ 	rga_request_put(request);
+ 
+ 	mutex_unlock(&request_manager->lock);
+@@ -886,7 +913,7 @@ static long rga_ioctl_blit(unsigned long arg, uint32_t cmd, struct rga_session *
+ 		goto err_free_request_by_id;
+ 	}
+ 
+-	request = rga_request_config(&user_request);
++	request = rga_request_config(&user_request, session);
+ 	if (IS_ERR(request)) {
+ 		rga_err("ID[%d]: config failed!\n", user_request.id);
+ 		ret = -EFAULT;
+@@ -1068,7 +1095,7 @@ static long rga_ioctl(struct file *file, uint32_t cmd, unsigned long arg)
+ 	case RGA_IOC_RELEASE_BUFFER:
+ 		rga_power_enable_all();
+ 
+-		ret = rga_ioctl_release_buffer(arg);
++		ret = rga_ioctl_release_buffer(arg, session);
+ 
+ 		rga_power_disable_all();
+ 
+@@ -1080,17 +1107,17 @@ static long rga_ioctl(struct file *file, uint32_t cmd, unsigned long arg)
+ 		break;
+ 
+ 	case RGA_IOC_REQUEST_SUBMIT:
+-		ret = rga_ioctl_request_submit(arg, true);
++		ret = rga_ioctl_request_submit(arg, true, session);
+ 
+ 		break;
+ 
+ 	case RGA_IOC_REQUEST_CONFIG:
+-		ret = rga_ioctl_request_submit(arg, false);
++		ret = rga_ioctl_request_submit(arg, false, session);
+ 
+ 		break;
+ 
+ 	case RGA_IOC_REQUEST_CANCEL:
+-		ret = rga_ioctl_request_cancel(arg);
++		ret = rga_ioctl_request_cancel(arg, session);
+ 
+ 		break;
+ 
+@@ -1156,6 +1183,8 @@ static int rga_open(struct inode *inode, struct file *file)
+ 	session = rga_session_init();
+ 	if (IS_ERR(session))
+ 		return PTR_ERR(session);
++	/* opi5 (experimental): Docker drops CAP_SYS_RAWIO from containers */
++	session->allow_phys = capable(CAP_SYS_RAWIO);
+ 
+ 	file->private_data = (void *)session;
+ 
+diff --git a/drivers/media/platform/rockchip/rga/rga3/rga_job.c b/drivers/media/platform/rockchip/rga/rga3/rga_job.c
+index 47d2034af90d..2d5b5c44968c 100644
+--- a/drivers/media/platform/rockchip/rga/rga3/rga_job.c
++++ b/drivers/media/platform/rockchip/rga/rga3/rga_job.c
+@@ -836,8 +836,11 @@ static void rga_request_release_abort(struct rga_request *request, int err_code)
+ 	rga_dma_fence_signal(request->release_fence, err_code);
+ 
+ 	mutex_lock(&request_manager->lock);
+-	/* current submit request put */
+-	rga_request_put(request);
++	/* current submit request put: the id's reference (opi5: once) */
++	if (!request->id_released) {
++		request->id_released = true;
++		rga_request_put(request);
++	}
+ 	mutex_unlock(&request_manager->lock);
+ }
+ 
+@@ -856,9 +859,10 @@ void rga_request_session_destroy_abort(struct rga_session *session)
+ 	mutex_lock(&request_manager->lock);
+ 
+ 	idr_for_each_entry(&request_manager->request_idr, request, request_id) {
+-		if (session == request->session) {
++		if (session == request->session && !request->id_released) {
+ 			rga_req_err(request, "destroy when the user exits, current refcount = %d\n",
+ 				kref_read(&request->refcount));
++			request->id_released = true;
+ 			rga_request_put(request);
+ 		}
+ 	}
+@@ -1053,9 +1057,16 @@ int rga_request_release_signal(struct rga_scheduler_t *scheduler, struct rga_job
+ 		if (DEBUGGER_EN(MSG))
+ 			rga_job_log(job, "finished %d failed %d\n", finished_count, failed_count);
+ 
+-		/* current submit request put */
++		/*
++		 * current submit request put: the id's reference.  opi5
++		 * (experimental): cancel, exit and finishing each dropped it;
++		 * only the first may.
++		 */
+ 		mutex_lock(&request_manager->lock);
+-		rga_request_put(request);
++		if (!request->id_released) {
++			request->id_released = true;
++			rga_request_put(request);
++		}
+ 		mutex_unlock(&request_manager->lock);
+ 	}
+ 
+@@ -1085,7 +1096,8 @@ int rga_request_release_signal(struct rga_scheduler_t *scheduler, struct rga_job
+ 	return 0;
+ }
+ 
+-struct rga_request *rga_request_config(struct rga_user_request *user_request)
++struct rga_request *rga_request_config(struct rga_user_request *user_request,
++				       struct rga_session *session)
+ {
+ 	int ret;
+ 	unsigned long flags;
+@@ -1108,6 +1120,13 @@ struct rga_request *rga_request_config(struct rga_user_request *user_request)
+ 		return ERR_PTR(-EINVAL);
+ 	}
+ 
++	/* opi5 (experimental): request ids are global; use only our own */
++	if (request->session != session || request->id_released) {
++		rga_err("request id[%d] is not this session's", user_request->id);
++		mutex_unlock(&request_manager->lock);
++		return ERR_PTR(-EINVAL);
++	}
++
+ 	rga_request_get(request);
+ 	mutex_unlock(&request_manager->lock);
+ 
+diff --git a/drivers/media/platform/rockchip/rga/rga3/rga_mm.c b/drivers/media/platform/rockchip/rga/rga3/rga_mm.c
+index 7ddac12013b9..7a4fadd99a05 100644
+--- a/drivers/media/platform/rockchip/rga/rga3/rga_mm.c
++++ b/drivers/media/platform/rockchip/rga/rga3/rga_mm.c
+@@ -920,7 +920,8 @@ static int rga_mm_buffer_destroy_for_idr(int id, void *ptr, void *data)
+ static struct rga_internal_buffer *
+ rga_mm_lookup_external(struct rga_mm *mm_session,
+ 		       struct rga_external_buffer *external_buffer,
+-		       struct mm_struct *current_mm)
++		       struct mm_struct *current_mm,
++		       struct rga_session *session)
+ {
+ 	int id;
+ 	struct dma_buf *dma_buf = NULL;
+@@ -935,8 +936,13 @@ rga_mm_lookup_external(struct rga_mm *mm_session,
+ 		if (IS_ERR(dma_buf))
+ 			return (struct rga_internal_buffer *)dma_buf;
+ 
++		/*
++		 * opi5 (experimental): never share another session's buffer; its
++		 * session's exit used to free it under this one.
++		 */
+ 		idr_for_each_entry(&mm_session->memory_idr, temp_buffer, id) {
+-			if (temp_buffer->dma_buffer == NULL)
++			if (temp_buffer->dma_buffer == NULL ||
++			    temp_buffer->session != session)
+ 				continue;
+ 
+ 			if (temp_buffer->dma_buffer[0].dma_buf == dma_buf) {
+@@ -949,7 +955,8 @@ rga_mm_lookup_external(struct rga_mm *mm_session,
+ 		break;
+ 	case RGA_VIRTUAL_ADDRESS:
+ 		idr_for_each_entry(&mm_session->memory_idr, temp_buffer, id) {
+-			if (temp_buffer->virt_addr == NULL)
++			if (temp_buffer->virt_addr == NULL ||
++			    temp_buffer->session != session)
+ 				continue;
+ 
+ 			if (temp_buffer->virt_addr->addr == external_buffer->memory) {
+@@ -965,6 +972,8 @@ rga_mm_lookup_external(struct rga_mm *mm_session,
+ 		break;
+ 	case RGA_PHYSICAL_ADDRESS:
+ 		idr_for_each_entry(&mm_session->memory_idr, temp_buffer, id) {
++			if (temp_buffer->session != session)
++				continue;
+ 			if (temp_buffer->phys_addr == external_buffer->memory) {
+ 				output_buffer = temp_buffer;
+ 				break;
+@@ -974,7 +983,8 @@ rga_mm_lookup_external(struct rga_mm *mm_session,
+ 		break;
+ 	case RGA_DMA_BUFFER_PTR:
+ 		idr_for_each_entry(&mm_session->memory_idr, temp_buffer, id) {
+-			if (temp_buffer->dma_buffer == NULL)
++			if (temp_buffer->dma_buffer == NULL ||
++			    temp_buffer->session != session)
+ 				continue;
+ 
+ 			if ((unsigned long)temp_buffer->dma_buffer[0].dma_buf ==
+@@ -1548,6 +1558,14 @@ static int rga_mm_get_buffer(struct rga_mm *mm,
+ 	}
+ 
+ 	internal_buffer = *buf;
++	/* opi5 (experimental): handles are global; use only our own */
++	if (job->session && internal_buffer->session != job->session) {
++		rga_job_err(job, "handle[%ld] belongs to another session.\n",
++			    (unsigned long)handle);
++		*buf = NULL;
++		mutex_unlock(&mm->lock);
++		return -EFAULT;
++	}
+ 	kref_get(&internal_buffer->refcount);
+ 
+ 	if (DEBUGGER_EN(MM)) {
+@@ -1835,7 +1853,8 @@ static void rga_mm_put_channel_external_buffer(struct rga_job_buffer *job_buffer
+ 
+ static int rga_mm_get_channel_external_buffer(int mmu_flag,
+ 					      struct rga_img_info_t *img_info,
+-					      struct rga_job_buffer *job_buffer)
++					      struct rga_job_buffer *job_buffer,
++					      bool allow_phys)
+ {
+ 	struct dma_buf *dma_buf = NULL;
+ 	struct rga_external_buffer *external_buffer = NULL;
+@@ -1862,6 +1881,12 @@ static int rga_mm_get_channel_external_buffer(int mmu_flag,
+ 		external_buffer->memory = (uint64_t)img_info->uv_addr;
+ 		external_buffer->type = RGA_VIRTUAL_ADDRESS;
+ 	} else if (img_info->uv_addr) {
++		if (!allow_phys) {
++			rga_err("physical address 0x%lx refused: needs CAP_SYS_RAWIO\n",
++				(unsigned long)img_info->uv_addr);
++			kfree(external_buffer);
++			return -EPERM;
++		}
+ 		external_buffer->memory = (uint64_t)img_info->uv_addr;
+ 		external_buffer->type = RGA_PHYSICAL_ADDRESS;
+ 	} else {
+@@ -1894,6 +1919,7 @@ static int rga_mm_get_external_buffer(struct rga_job *job)
+ {
+ 	int ret = -EINVAL;
+ 	int mmu_flag;
++	bool allow_phys = job->session && job->session->allow_phys;
+ 
+ 	struct rga_img_info_t *src0 = NULL;
+ 	struct rga_img_info_t *src1 = NULL;
+@@ -1913,7 +1939,8 @@ static int rga_mm_get_external_buffer(struct rga_job *job)
+ 
+ 	if (likely(src0)) {
+ 		mmu_flag = ((job->rga_command_base.mmu_info.mmu_flag >> 8) & 1);
+-		ret = rga_mm_get_channel_external_buffer(mmu_flag, src0, &job->src_buffer);
++		ret = rga_mm_get_channel_external_buffer(mmu_flag, src0, &job->src_buffer,
++							  allow_phys);
+ 		if (ret < 0) {
+ 			rga_job_err(job, "Cannot get src0 channel buffer!\n");
+ 			return ret;
+@@ -1922,7 +1949,8 @@ static int rga_mm_get_external_buffer(struct rga_job *job)
+ 
+ 	if (likely(dst)) {
+ 		mmu_flag = ((job->rga_command_base.mmu_info.mmu_flag >> 10) & 1);
+-		ret = rga_mm_get_channel_external_buffer(mmu_flag, dst, &job->dst_buffer);
++		ret = rga_mm_get_channel_external_buffer(mmu_flag, dst, &job->dst_buffer,
++							  allow_phys);
+ 		if (ret < 0) {
+ 			rga_job_err(job, "Cannot get dst channel buffer!\n");
+ 			goto error_put_buffer;
+@@ -1931,7 +1959,8 @@ static int rga_mm_get_external_buffer(struct rga_job *job)
+ 
+ 	if (src1) {
+ 		mmu_flag = ((job->rga_command_base.mmu_info.mmu_flag >> 9) & 1);
+-		ret = rga_mm_get_channel_external_buffer(mmu_flag, src1, &job->src1_buffer);
++		ret = rga_mm_get_channel_external_buffer(mmu_flag, src1, &job->src1_buffer,
++							  allow_phys);
+ 		if (ret < 0) {
+ 			rga_job_err(job, "Cannot get src1 channel buffer!\n");
+ 			goto error_put_buffer;
+@@ -1940,7 +1969,8 @@ static int rga_mm_get_external_buffer(struct rga_job *job)
+ 
+ 	if (els) {
+ 		mmu_flag = ((job->rga_command_base.mmu_info.mmu_flag >> 11) & 1);
+-		ret = rga_mm_get_channel_external_buffer(mmu_flag, els, &job->els_buffer);
++		ret = rga_mm_get_channel_external_buffer(mmu_flag, els, &job->els_buffer,
++							  allow_phys);
+ 		if (ret < 0) {
+ 			rga_job_err(job, "Cannot get els channel buffer!\n");
+ 			goto error_put_buffer;
+@@ -2393,12 +2423,21 @@ int rga_mm_import_buffer(struct rga_external_buffer *external_buffer,
+ 		return -EFAULT;
+ 	}
+ 
++	if (external_buffer->type == RGA_PHYSICAL_ADDRESS &&
++	    !(session && session->allow_phys)) {
++		rga_err("physical address 0x%lx refused: needs CAP_SYS_RAWIO\n",
++			(unsigned long)external_buffer->memory);
++		return -EPERM;
++	}
++
+ 	mutex_lock(&mm->lock);
+ 
+ 	/* first, Check whether to rga_mm */
+-	internal_buffer = rga_mm_lookup_external(mm, external_buffer, current->mm);
++	internal_buffer = rga_mm_lookup_external(mm, external_buffer, current->mm,
++						 session);
+ 	if (!IS_ERR_OR_NULL(internal_buffer)) {
+ 		kref_get(&internal_buffer->refcount);
++		internal_buffer->import_count++;
+ 
+ 		mutex_unlock(&mm->lock);
+ 
+@@ -2424,6 +2463,7 @@ int rga_mm_import_buffer(struct rga_external_buffer *external_buffer,
+ 		goto FREE_INTERNAL_BUFFER;
+ 
+ 	kref_init(&internal_buffer->refcount);
++	internal_buffer->import_count = 1;
+ 	internal_buffer->session = session;
+ 
+ 	mutex_lock(&mm->lock);
+@@ -2464,7 +2504,7 @@ int rga_mm_import_buffer(struct rga_external_buffer *external_buffer,
+ 	return ret;
+ }
+ 
+-int rga_mm_release_buffer(uint32_t handle)
++int rga_mm_release_buffer(uint32_t handle, struct rga_session *session)
+ {
+ 	struct rga_mm *mm;
+ 	struct rga_internal_buffer *internal_buffer;
+@@ -2487,6 +2527,18 @@ int rga_mm_release_buffer(uint32_t handle)
+ 		return -ENOENT;
+ 	}
+ 
++	/*
++	 * opi5 (experimental): handles are global.  Another session's release,
++	 * or one release too many, dropped references running jobs hold.
++	 */
++	if (internal_buffer->session != session || internal_buffer->import_count <= 0) {
++		rga_err("handle = %d is not imported by this session\n", (int)handle);
++
++		mutex_unlock(&mm->lock);
++		return -ENOENT;
++	}
++	internal_buffer->import_count--;
++
+ 	if (DEBUGGER_EN(MM)) {
+ 		rga_buf_log(internal_buffer, "release buffer:\n");
+ 		rga_mm_dump_buffer(internal_buffer);
+@@ -2517,11 +2569,22 @@ int rga_mm_session_release_buffer(struct rga_session *session)
+ 
+ 	mutex_lock(&mm->lock);
+ 
++	/*
++	 * opi5 (experimental): drop the session's import references instead
++	 * of freeing outright.  A job still holding the buffer keeps it until
++	 * it finishes.  kref release drops and retakes mm->lock;
++	 * idr_for_each_entry looks the next id up afresh, so that is safe.
++	 */
+ 	idr_for_each_entry(&mm->memory_idr, buffer, i) {
+ 		if (session == buffer->session) {
+ 			rga_err("[tgid:%d] Destroy handle[%d] when the user exits\n",
+ 			       session->tgid, buffer->handle);
+-			rga_mm_force_releaser_buffer(buffer);
++			buffer->session = NULL;
++			while (buffer->import_count > 0) {
++				buffer->import_count--;
++				if (kref_put(&buffer->refcount, rga_mm_kref_release_buffer))
++					break;
++			}
+ 		}
+ 	}
+ 

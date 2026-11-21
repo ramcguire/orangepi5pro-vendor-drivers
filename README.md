@@ -1,0 +1,106 @@
+# orangepi5pro-vendor-drivers
+
+Armbian's "current" kernel (6.18) for the **Orange Pi 5 Pro** (RK3588S), with Rockchip's vendor drivers:
+
+- **MPP** (`/dev/mpp_service`): both RKVDEC2 decoder and RKVENC2 encoder cores;
+- **multi-RGA** (`/dev/rga`): both RGA3 cores and RGA2;
+- **RKNPU 0.9.8** (`/dev/rknpu`): all three NPU cores, for Rockchip's `librknnrt`.
+
+It's an Armbian [`userpatches/`](userpatches/) directory: patches, device tree, one extension, one build config.
+
+## Use
+
+**Packages.** Each [release](../../releases) has the `linux-image`, `linux-dtb` and `linux-headers` packages. On an Armbian `current` install for the Orange Pi 5 Pro:
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+apt install ./linux-image-*.deb ./linux-dtb-*.deb ./linux-headers-*.deb
+apt-mark hold linux-image-current-rockchip64 linux-dtb-current-rockchip64 linux-headers-current-rockchip64
+reboot
+```
+
+The packages carry the names of Armbian's kernel, so hold them, or Armbian's repository replaces them.
+
+**Userspace.** For the codecs and RGA, use FFmpeg built with rkmpp and librga. NPU clients need `/dev/rknpu`, `/dev/dma_heap` and `librknnrt` 2.3.2; 2.3.0 times out every job on this driver.
+
+**Build with Armbian.** Copy `userpatches/` (or a release's `opi5-userpatches-*.tar.gz`) into [armbian/build](https://github.com/armbian/build) at the tag `build.sh` pins, then run `./compile.sh opi5 kernel`. To add the drivers to another build, copy `kernel/archive/rockchip64-6.18/` and `extensions/opi5.sh` and set `ENABLE_EXTENSIONS=opi5`.
+
+**Build here.** With Docker and [mise](https://mise.jdx.dev), on any OS, `mise run build` runs `build.sh` in Armbian's builder image. The packages and logs go to `out/`, and caches go to the `opi5-armbian` volume. Arguments after `--` go to `compile.sh`. The other tasks (`mise tasks`):
+
+- `modules`: only the three drivers, their KUnit tests and the DTB, into `out/drivers/`. Uses the config of the package in `out/` if there is one, so they load on that kernel.
+- `check`: applies every patch with Armbian's patcher, failing on any that doesn't apply or of ours that needs fuzz, then compiles the drivers (`tools/patch.sh`).
+- `kunit`: boots the built package in QEMU and runs every KUnit suite in it (`tools/kunit.sh`).
+- `bump-report`: a report on the last `check`, for bumps (below).
+- `tests`: the abuse tests (Hardening), as static arm64 binaries.
+- `queue-import`, `queue-export`, `shell`: edit the patches as git commits (`tools/queue.sh`). Rewrite them in `mise run shell`, then export.
+- `lint`, `renovate-check`, `clean`.
+
+**CI.** `check.yml` runs `check` on every push. A tag `v<kernel>-<n>` runs `build.yml`, which builds, runs `kunit`, and publishes a release.
+
+**Bumps** follow Armbian's tags. Renovate moves the Armbian tag and the 6.18.y kernel tag together in one pull request, and we don't patch ahead of Armbian. On those pull requests, `check.yml` adds `tools/bump-report.sh`'s report:
+- Armbian patches that failed;
+- Armbian patches that overlap ours;
+- new NPU source commits, to mark applied or not applicable;
+- config drift. Explain it, then `mise run bump-report -- --update`.
+
+## Patches
+
+The thousands digit is the purpose.
+
+| Patch | What it does |
+| --- | --- |
+| **1xxx: MPP/RGA import** | New files only, from Rockchip's `kernel` `develop-6.1` at `b4ef083dc0c3` |
+| `1010` | `rk-mpp.h`, the vendor request ABI |
+| `1020` | The MPP service (`rk_vcodec`), runtime PM instead of the PMU idle hint |
+| `1030` | RKVDEC2: both cores and their CCU; devfreq compiled out |
+| `1040` | RKVENC2: both cores; OPP, IPA and devfreq compiled out |
+| `1050` | Multi-RGA (`rga3`) |
+| **2xxx: 6.18 under Armbian** | |
+| `2010` | RGA: drops an unexported page-walk fallback, fixes the IOMMU fault handler and DMA segment size |
+| `2020` | The Kconfig/Makefile hooks, the only lines in files mainline or Armbian own |
+| **3xxx: fixes from the board** | |
+| `3010` | RKVDEC2 CCU timeout at 4K: 106.7 → 120 ms |
+| **4xxx: hardening (ours)** | Hardening below |
+| `4010` | MPP: bound user requests |
+| `4020` | RGA: own requests and buffers |
+| **5xxx: NPU** (`rknpu.ko`) | |
+| `5010` | [w568w/rknpu-module](https://github.com/w568w/rknpu-module) at `a8792fe6b633`, unchanged |
+| `5020` | [mack42/OrangePi5Pro](https://github.com/mack42/OrangePi5Pro)'s mainline port at `6798f7e8af4e`: memory ioctls, devfreq, multi-core, `/dev/rknpu` |
+| `5030` | Power off once the IOMMU has actually suspended; the NPU was never clock-gated |
+| `5040` | Free a client's imported buffers when it closes |
+| `5050` | NPU: harden user input (ours) |
+| **6xxx: KUnit tests (ours)** | Modules only. Loading one runs it and taints the kernel |
+| `6010` | `mpp_kunit`: the ABI (1010), command filter, request bounds (4010), CCU timeout (3010). With `CONFIG_KUNIT`, the functions under test are exported in `EXPORTED_FOR_KUNIT_TESTING` |
+| `6020` | `rga_kunit`: the request filter, one base address per buffer (2010). `rga3.ko` won't load without RGA cores, so the checks are header inlines the test includes |
+
+**Device tree.** `dt/rk3588s-orangepi-5-pro.dts` is Armbian's file plus two `#include`s, and `check` fails if it drifts from Armbian's.
+- `-mpp.dtsi`: the codec and RGA3 cores, their CCUs and IOMMUs. It points `&rga` at the vendor RGA2 driver and disables the V4L2 decoders. Keep the node order: the RGA3 scheduler bits follow probe order.
+- `-npu.dtsi`: mack42's vendor NPU node in place of mainline's rocket nodes, with one IOMMU domain for all three cores.
+
+**Kernel config.** `extensions/opi5.sh` builds the drivers and tests as modules. It turns off the V4L2 decoder and rocket (they bind the same hardware), and turns on the lockup and hung-task detectors, warn-only. The build fails if an option is missing from the final `.config`.
+
+## Hardening
+
+`4010`, `4020` and `5050` are ours, written from reading the vendor code. The devices are root-only on the host, but containers that use them get them, and without these patches a buggy or compromised process there could corrupt kernel memory. They passed the abuse tests (`tests/`, each file's header says how to run it) and every bench stage. If other userspace hits a check, the kernel log names it.
+
+- **`4010`, MPP:** bounds checks done in `int` (a 2 GB offset passed), unchecked register-table and RCB indices, rkvenc2 array overruns, any fd accepted as a session.
+- **`4020`, RGA:** physical addresses mapped as given, a kernel pointer taken from userspace, and global request ids and buffer handles: one client could cancel or free another's.
+- **`5050`, NPU:** userspace addresses used as kernel pointers, unchecked task indices. Buffers are now the caller's own and reference-counted.
+
+**Not fixed:**
+- Userspace programs the codec registers, so a client can make the hardware DMA anywhere in the shared IOMMU domain. This is a hardware design limit.
+- An async NPU job's buffers can be unmapped if its client exits mid-job. librknnrt 2.3.2 only submits blocking jobs.
+
+## Known limits
+
+- Fixed-clock codecs: the decoder runs at 786/594 MHz.
+- No 10-bit hardware encode. HDR goes to 8-bit through RGA, still tagged BT.2020/PQ.
+- RGA2 is untested: no workload has reached it.
+- Keep suspend off: an earlier build hung on resume.
+- An NPU client that keeps timing out can freeze the board (librknnrt 2.3.0). Use 2.3.2.
+
+## License
+
+GPL-2.0, as Armbian ([LICENSE](LICENSE)). The kernel files keep their own SPDX headers: MPP and the device tree `(GPL-2.0+ OR MIT)`, `rk-mpp.h` with the Linux-syscall-note, RGA and RKNPU `GPL-2.0`, the NPU dtsi `GPL-2.0-only`.
+
+**Source**, as Armbian provides it: a release's source is this repository at its tag. That pins the kernel.org tag, Armbian's commit (its patches and fetched driver sources) and our patches; `build.sh` rebuilds the packages from them. The config ships as `/boot/config-<release>`.

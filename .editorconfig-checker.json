@@ -1,0 +1,4 @@
+{
+  "SpacesAfterTabs": true,
+  "Exclude": ["^LICENSE$"]
+}

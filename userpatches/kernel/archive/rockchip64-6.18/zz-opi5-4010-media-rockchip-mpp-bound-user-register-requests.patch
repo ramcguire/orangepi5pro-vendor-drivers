@@ -1,0 +1,215 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: opi5 <noreply@example.invalid>
+Date: Sat, 14 Nov 2026 00:00:00 +0000
+Subject: [PATCH] media: rockchip: mpp: bound user register requests
+
+Any process with /dev/mpp_service could write kernel memory:
+- mpp_check_req() used int: offsets >= 2 GB went negative and passed,
+  offset == max_size passed, and oversize requests were clamped to the
+  excess. Use u32 and clamp to what fits.
+- MPP_CMD_SET_REG_ADDR_OFFSET overran elem[] by up to 7 bytes, and
+  mpp_translate_reg_offset_info() didn't check the register index.
+- rkvdec2's RCB setup didn't check the register index.
+- rkvenc2 could add up to 9 w_reqs/r_reqs entries per request to 16-entry
+  arrays, and its RCB lookup could use an unallocated class buffer.
+- MPP_CMD_SET_SESSION_FD used any fd's private_data as a session. Only
+  accept MPP files.
+---
+ .../media/platform/rockchip/mpp/mpp_common.c  | 47 +++++++++++++++----
+ .../media/platform/rockchip/mpp/mpp_common.h  |  2 +-
+ .../media/platform/rockchip/mpp/mpp_rkvdec2.c | 12 ++++-
+ .../media/platform/rockchip/mpp/mpp_rkvenc2.c | 17 +++++++
+ 4 files changed, 66 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/mpp/mpp_common.c b/drivers/media/platform/rockchip/mpp/mpp_common.c
+index 18c4343573a1..0161ddd21be3 100644
+--- a/drivers/media/platform/rockchip/mpp/mpp_common.c
++++ b/drivers/media/platform/rockchip/mpp/mpp_common.c
+@@ -1556,6 +1556,16 @@ static int mpp_collect_msgs(struct list_head *head, struct mpp_session *session,
+ 			goto session_switch_done;
+ 
+ 		f = fdget(bat_msg.fd);
++		/*
++		 * opi5 (experimental): the fd's private_data becomes the session,
++		 * so it must be an MPP file.  Any other fd (a pipe, a dma-buf)
++		 * was used as a struct mpp_session.
++		 */
++		if (!fd_empty(f) && (fd_file(f)->f_op != &rockchip_mpp_fops ||
++				     !fd_file(f)->private_data)) {
++			fdput(f);
++			f = EMPTY_FD;
++		}
+ 		if (fd_empty(f)) {
+ 			int ret = -EBADF;
+ 
+@@ -1915,33 +1925,45 @@ int mpp_translate_reg_address(struct mpp_session *session,
+ int mpp_check_req(struct mpp_request *req, int base,
+ 		  int max_size, u32 off_s, u32 off_e)
+ {
+-	int req_off;
++	/*
++	 * opi5 (experimental): the BSP did this in int arithmetic.  An offset
++	 * of 2 GB or more went negative and passed every check, offset ==
++	 * max_size passed, and an oversized request was "clamped" to the
++	 * excess (req_off + size - max_size) instead of what fits, so the
++	 * callers' copy_from_user(reg + offset, data, size) wrote past the
++	 * register array.
++	 */
++	u32 req_off;
+ 
+-	if (req->offset < base) {
++	if (base < 0 || max_size < 0) {
++		mpp_err("error: base %d, max_size %d\n", base, max_size);
++		return -EINVAL;
++	}
++	if (req->offset < (u32)base) {
+ 		mpp_err("error: base %x, offset %x\n",
+ 			base, req->offset);
+ 		return -EINVAL;
+ 	}
+ 	req_off = req->offset - base;
+-	if ((req_off + req->size) < off_s) {
++	if ((u64)req_off + req->size < off_s) {
+ 		mpp_err("error: req_off %x, req_size %x, off_s %x\n",
+ 			req_off, req->size, off_s);
+ 		return -EINVAL;
+ 	}
+-	if (max_size < off_e) {
++	if ((u32)max_size < off_e) {
+ 		mpp_err("error: off_e %x, max_size %x\n",
+ 			off_e, max_size);
+ 		return -EINVAL;
+ 	}
+-	if (req_off > max_size) {
++	if (req_off >= (u32)max_size) {
+ 		mpp_err("error: req_off %x, max_size %x\n",
+ 			req_off, max_size);
+ 		return -EINVAL;
+ 	}
+-	if ((req_off + req->size) > max_size) {
++	if ((u64)req_off + req->size > (u32)max_size) {
+ 		mpp_err("error: req_off %x, req_size %x, max_size %x\n",
+ 			req_off, req->size, max_size);
+-		req->size = req_off + req->size - max_size;
++		req->size = max_size - req_off;
+ 	}
+ 
+ 	return 0;
+@@ -1958,8 +1980,9 @@ int mpp_extract_reg_offset_info(struct reg_offset_info *off_inf,
+ 			cnt, off_inf->cnt, max_size);
+ 		return -EINVAL;
+ 	}
++	/* opi5 (experimental): whole entries only; size % 8 overran elem[]. */
+ 	if (copy_from_user(&off_inf->elem[off_inf->cnt],
+-			   req->data, req->size)) {
++			   req->data, cnt * sizeof(off_inf->elem[0]))) {
+ 		mpp_err("copy_from_user failed\n");
+ 		return -EINVAL;
+ 	}
+@@ -1987,7 +2010,7 @@ int mpp_query_reg_offset_info(struct reg_offset_info *off_inf,
+ 
+ int mpp_translate_reg_offset_info(struct mpp_task *task,
+ 				  struct reg_offset_info *off_inf,
+-				  u32 *reg)
++				  u32 *reg, u32 reg_num)
+ {
+ 	mpp_debug_enter();
+ 
+@@ -1998,6 +2021,12 @@ int mpp_translate_reg_offset_info(struct mpp_task *task,
+ 			mpp_debug(DEBUG_IOMMU, "reg[%d] + offset %d\n",
+ 				  off_inf->elem[i].index,
+ 				  off_inf->elem[i].offset);
++			/* opi5 (experimental): index comes from userspace */
++			if (off_inf->elem[i].index >= reg_num) {
++				mpp_err("reg offset index %u out of %u\n",
++					off_inf->elem[i].index, reg_num);
++				continue;
++			}
+ 			reg[off_inf->elem[i].index] += off_inf->elem[i].offset;
+ 		}
+ 	}
+diff --git a/drivers/media/platform/rockchip/mpp/mpp_common.h b/drivers/media/platform/rockchip/mpp/mpp_common.h
+index 1fd707b48849..c8202f56cada 100644
+--- a/drivers/media/platform/rockchip/mpp/mpp_common.h
++++ b/drivers/media/platform/rockchip/mpp/mpp_common.h
+@@ -641,7 +641,7 @@ int mpp_query_reg_offset_info(struct reg_offset_info *off_inf,
+ 			      u32 index);
+ int mpp_translate_reg_offset_info(struct mpp_task *task,
+ 				  struct reg_offset_info *off_inf,
+-				  u32 *reg);
++				  u32 *reg, u32 reg_num);
+ int mpp_task_init(struct mpp_session *session,
+ 		  struct mpp_task *task);
+ int mpp_task_finish(struct mpp_session *session,
+diff --git a/drivers/media/platform/rockchip/mpp/mpp_rkvdec2.c b/drivers/media/platform/rockchip/mpp/mpp_rkvdec2.c
+index 9a1a973d60f9..4f3653993a56 100644
+--- a/drivers/media/platform/rockchip/mpp/mpp_rkvdec2.c
++++ b/drivers/media/platform/rockchip/mpp/mpp_rkvdec2.c
+@@ -351,7 +351,14 @@ int mpp_set_rcbbuf(struct mpp_dev *mpp, struct mpp_session *session,
+ 		for (i = 0; i < rcb_inf->cnt; i++) {
+ 			reg_idx = rcb_inf->elem[i].index;
+ 			rcb_size = rcb_inf->elem[i].size;
+-			if ((rcb_offset + rcb_size) > dec->rcb_size) {
++			/* opi5 (experimental): both come from userspace */
++			/* task->reg points at rkvdec2_task.reg[RKVDEC_REG_NUM] */
++			if (reg_idx >= RKVDEC_REG_NUM) {
++				mpp_err("rcb: reg index %u out of %u\n",
++					reg_idx, RKVDEC_REG_NUM);
++				continue;
++			}
++			if ((u64)rcb_offset + rcb_size > dec->rcb_size) {
+ 				mpp_debug(DEBUG_SRAM_INFO,
+ 					  "rcb: reg %d use original buffer\n", reg_idx);
+ 				continue;
+@@ -394,7 +401,8 @@ int rkvdec2_task_init(struct mpp_dev *mpp, struct mpp_session *session,
+ 		if (ret)
+ 			goto fail;
+ 
+-		mpp_translate_reg_offset_info(mpp_task, &task->off_inf, task->reg);
++		mpp_translate_reg_offset_info(mpp_task, &task->off_inf, task->reg,
++					      ARRAY_SIZE(task->reg));
+ 	}
+ 
+ 	task->strm_addr = task->reg[RKVDEC_REG_RLC_BASE_INDEX];
+diff --git a/drivers/media/platform/rockchip/mpp/mpp_rkvenc2.c b/drivers/media/platform/rockchip/mpp/mpp_rkvenc2.c
+index eb4ac8c0aba6..c5f352815d38 100644
+--- a/drivers/media/platform/rockchip/mpp/mpp_rkvenc2.c
++++ b/drivers/media/platform/rockchip/mpp/mpp_rkvenc2.c
+@@ -900,6 +900,9 @@ static u32 *rkvenc_get_class_reg(struct rkvenc_task *task, u32 addr)
+ 		base_s = hw->reg_msg[i].base_s;
+ 		base_e = hw->reg_msg[i].base_e;
+ 		if (addr >= base_s && addr < base_e) {
++			/* opi5 (experimental): the RCB path may name an unallocated class */
++			if (!task->reg[i].data)
++				break;
+ 			reg = (u8 *)task->reg[i].data + (addr - base_s);
+ 			break;
+ 		}
+@@ -952,6 +955,15 @@ static int rkvenc_extract_task_msg(struct mpp_session *session,
+ 				if (!req_over_class(req, task, j))
+ 					continue;
+ 
++				/*
++				 * opi5 (experimental): one request adds an entry per class
++				 * it spans, so 16 requests could add 9 times as many.
++				 */
++				if (task->w_req_cnt >= ARRAY_SIZE(task->w_reqs)) {
++					mpp_err("too many register writes\n");
++					ret = -EINVAL;
++					goto fail;
++				}
+ 				ret = rkvenc_alloc_class_msg(task, j);
+ 				if (ret) {
+ 					mpp_err("alloc class msg %d fail.\n", j);
+@@ -981,6 +993,11 @@ static int rkvenc_extract_task_msg(struct mpp_session *session,
+ 				if (!req_over_class(req, task, j))
+ 					continue;
+ 
++				if (task->r_req_cnt >= ARRAY_SIZE(task->r_reqs)) {
++					mpp_err("too many register reads\n");
++					ret = -EINVAL;
++					goto fail;
++				}
+ 				ret = rkvenc_alloc_class_msg(task, j);
+ 				if (ret) {
+ 					mpp_err("alloc class msg reg %d fail.\n", j);

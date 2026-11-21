@@ -1,0 +1,113 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * opi5: the RK3588 NPU for the vendor rknpu driver (zz-opi5-5xxx), in place of
+ * the mainline rocket nodes. Included at the end of rk3588s-orangepi-5-pro.dts.
+ *
+ * From mack42/OrangePi5Pro's overlay (customize-image-npu.sh at 6798f7e8af4e).
+ *
+ * All four NPU MMU banks are in rknn_mmu_0: rockchip-iommu programs every "reg"
+ * bank of a node with the same page table, so the three cores share one DMA
+ * domain, and rknpu enables all three cores (core mask 0x7) for a 4-bank node.
+ * rknpu_power_on() powers the cores' clocks and domains before it resumes the
+ * IOMMU, so the core1/core2 banks are only touched powered.
+ */
+
+&rknn_core_0 { status = "disabled"; };
+&rknn_core_1 { status = "disabled"; };
+&rknn_core_2 { status = "disabled"; };
+
+/* Their banks are in rknn_mmu_0: enabled, they would claim the same MMIO
+ * (-EBUSY) and could rebind the NPU to a one-bank IOMMU. */
+&rknn_mmu_1 { status = "disabled"; };
+&rknn_mmu_2 { status = "disabled"; };
+
+/* Banks: fdab9000 and fdaba000 core0, fdaca000 core1, fdada000 core2. Each
+ * bank's fault IRQ is shared with its core (rk_iommu and rknpu both request
+ * them IRQF_SHARED). */
+&rknn_mmu_0 {
+	reg = <0x0 0xfdab9000 0x0 0x100>,
+	  <0x0 0xfdaba000 0x0 0x100>,
+	  <0x0 0xfdaca000 0x0 0x100>,
+	  <0x0 0xfdada000 0x0 0x100>;
+	interrupts = <GIC_SPI 110 IRQ_TYPE_LEVEL_HIGH 0>,
+		 <GIC_SPI 111 IRQ_TYPE_LEVEL_HIGH 0>,
+		 <GIC_SPI 112 IRQ_TYPE_LEVEL_HIGH 0>;
+};
+
+/ {
+	npu_opp: opp-table-npu {
+		compatible = "operating-points-v2";
+
+		/* Voltages: Rockchip's BSP worst-bin values (300-600 MHz: 675 mV,
+		 * 700: 700, 800: 750, 900: 800, 1000: 850 mV) rounded up for
+		 * margin, never below the rail's 800 mV, and capped by
+		 * vdd_npu_s0's 950 mV. */
+		opp-300000000 { opp-hz = /bits/ 64 <300000000>; opp-microvolt = <800000 800000 950000>; };
+		opp-400000000 { opp-hz = /bits/ 64 <400000000>; opp-microvolt = <800000 800000 950000>; };
+		opp-500000000 { opp-hz = /bits/ 64 <500000000>; opp-microvolt = <825000 825000 950000>; };
+		opp-600000000 { opp-hz = /bits/ 64 <600000000>; opp-microvolt = <850000 850000 950000>; };
+		opp-700000000 { opp-hz = /bits/ 64 <700000000>; opp-microvolt = <875000 875000 950000>; };
+		opp-800000000 { opp-hz = /bits/ 64 <800000000>; opp-microvolt = <900000 900000 950000>; };
+		opp-900000000 { opp-hz = /bits/ 64 <900000000>; opp-microvolt = <925000 925000 950000>; };
+		opp-1000000000 { opp-hz = /bits/ 64 <1000000000>; opp-microvolt = <950000 950000 950000>; };
+	};
+
+	rknpu: npu@fdab0000 {
+		compatible = "rockchip,rk3588-rknpu", "rockchip,rknpu";
+		reg = <0x0 0xfdab0000 0x0 0x9000>,
+	      <0x0 0xfdac0000 0x0 0x9000>,
+	      <0x0 0xfdad0000 0x0 0x9000>;
+		reg-names = "rknpu_core0", "rknpu_core1", "rknpu_core2";
+
+		interrupts = <GIC_SPI 110 IRQ_TYPE_LEVEL_HIGH 0>,
+		     <GIC_SPI 111 IRQ_TYPE_LEVEL_HIGH 0>,
+		     <GIC_SPI 112 IRQ_TYPE_LEVEL_HIGH 0>;
+		/* The names rknpu_drv.c looks up. */
+		interrupt-names = "npu0_irq", "npu1_irq", "npu2_irq";
+
+		/* rknpu holds every clock listed here while the NPU is powered.
+		 * clk_npu must stay first: the driver reports its rate from
+		 * clks[0].
+		 *
+		 * aclk/hclk: the cores' register interfaces. Mainline gives them
+		 * to the IOMMU nodes only; gated, the cores' registers read 0 and
+		 * librknnrt takes the SoC for an RK3566/68.
+		 *
+		 * pclk/pvtm: TF-A changes the NPU rate through the NPU GRF, and
+		 * that access hangs the SoC when mainline has gated
+		 * pclk_npu_root as unused. */
+		clocks = <&scmi_clk SCMI_CLK_NPU>,
+		 <&cru ACLK_NPU0>, <&cru ACLK_NPU1>, <&cru ACLK_NPU2>,
+		 <&cru HCLK_NPU0>, <&cru HCLK_NPU1>, <&cru HCLK_NPU2>,
+		 <&cru PCLK_NPU_ROOT>, <&cru PCLK_NPU_GRF>,
+		 <&cru PCLK_NPU_PVTM>, <&cru CLK_NPU_PVTM>,
+		 <&cru CLK_CORE_NPU_PVTM>, <&cru HCLK_NPU_ROOT>;
+		clock-names = "clk_npu", "aclk0", "aclk1", "aclk2",
+		      "hclk0", "hclk1", "hclk2",
+		      "pclk", "pclk_grf", "pclk_pvtm", "clk_pvtm",
+		      "clk_core_pvtm", "hclk_root";
+
+		/* 0 overrides rknn_core_0's 200 MHz, which would otherwise be set
+		 * on every bind, before rknpu holds its clocks (see above). The
+		 * rate stays as firmware left it until devfreq changes it. */
+		assigned-clocks = <&scmi_clk SCMI_CLK_NPU>;
+		assigned-clock-rates = <0>;
+
+		power-domains = <&power RK3588_PD_NPUTOP>,
+						<&power RK3588_PD_NPU1>,
+						<&power RK3588_PD_NPU2>;
+		/* The names rknpu_drv.c attaches. */
+		power-domain-names = "npu0", "npu1", "npu2";
+
+		iommus = <&rknn_mmu_0>;
+
+		operating-points-v2 = <&npu_opp>;
+
+		/* One rail under each name the driver looks up. */
+		npu-supply = <&vdd_npu_s0>;
+		rknpu-supply = <&vdd_npu_s0>;
+		sram-supply = <&vdd_npu_s0>;
+
+		status = "okay";
+	};
+};

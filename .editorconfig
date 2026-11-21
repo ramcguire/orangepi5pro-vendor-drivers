@@ -1,0 +1,34 @@
+# https://editorconfig.org
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+# Armbian's style for its scripts and configs.
+[*.{sh,conf}]
+indent_style = tab
+
+# Kernel style, as the drivers they test.
+[*.c]
+indent_style = tab
+
+[Makefile]
+indent_style = tab
+
+[*.{dts,dtsi}]
+indent_style = tab
+trim_trailing_whitespace = false
+
+# Patches are byte-exact.
+[*.patch]
+trim_trailing_whitespace = false
+insert_final_newline = false
+
+# Markdown indents follow list nesting, not a fixed width.
+[*.md]
+indent_size = unset

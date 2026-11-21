@@ -1,0 +1,32 @@
+name: Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+  KERNEL_GIT: shallow
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
+
+      - name: Lint
+        run: mise run lint
+
+      - name: Apply the patches and compile the drivers
+        run: mise run check
+
+      # On Renovate's bumps, also when the check failed: the report shows why.
+      - name: Bump report
+        if: ${{ !cancelled() && startsWith(github.head_ref, 'renovate/') }}
+        run: mise run bump-report >> "$GITHUB_STEP_SUMMARY"

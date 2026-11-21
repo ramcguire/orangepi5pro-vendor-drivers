@@ -1,0 +1,153 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: opi5 <noreply@example.invalid>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH] rknpu: free imported dma-bufs on close
+
+rknpu_mem.c never put imports on the session list, so only
+RKNPU_MEM_DESTROY freed them. A client that exited without it leaked the
+mapping and the dma-buf reference until imports failed with -ENOMEM.
+
+Add imports to the session list and free leftovers in rknpu_release().
+MEM_DESTROY looks the object up on the list instead of dereferencing the
+pointer from userspace.
+---
+ drivers/rknpu/src/include/rknpu_mem.h |  1 +
+ drivers/rknpu/src/rknpu_drv.c         | 17 ++--------
+ drivers/rknpu/src/rknpu_mem.c         | 46 +++++++++++++++++++++------
+ 3 files changed, 40 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/rknpu/src/include/rknpu_mem.h b/drivers/rknpu/src/include/rknpu_mem.h
+index d2f4757c05f9..f154957c103b 100644
+--- a/drivers/rknpu/src/include/rknpu_mem.h
++++ b/drivers/rknpu/src/include/rknpu_mem.h
+@@ -43,5 +43,6 @@ int rknpu_mem_create_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
+ int rknpu_mem_destroy_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
+ 			    unsigned long data);
+ int rknpu_mem_sync_ioctl(struct rknpu_device *rknpu_dev, unsigned long data);
++void rknpu_mem_import_free(struct rknpu_mem_object *obj);
+ 
+ #endif
+diff --git a/drivers/rknpu/src/rknpu_drv.c b/drivers/rknpu/src/rknpu_drv.c
+index 8f4708e0b152..0957badd87e6 100644
+--- a/drivers/rknpu/src/rknpu_drv.c
++++ b/drivers/rknpu/src/rknpu_drv.c
+@@ -570,22 +570,9 @@ static int rknpu_release(struct inode *inode, struct file *file)
+ 			"Fd close free rknpu_obj: %#llx, rknpu_obj->dma_addr: %#llx\n",
+ 			(__u64)(uintptr_t)entry, (__u64)entry->dma_addr);
+ 
+-		if (entry->kv_addr) {
+-			struct iosys_map map =
+-				IOSYS_MAP_INIT_VADDR(entry->kv_addr);
+-			dma_buf_vunmap(entry->dmabuf, &map);
+-			entry->kv_addr = NULL;
+-		}
+-
+-		dma_buf_unmap_attachment(entry->attachment, entry->sgt,
+-					 DMA_BIDIRECTIONAL);
+-		dma_buf_detach(entry->dmabuf, entry->attachment);
+-
+-		if (!entry->owner)
+-			dma_buf_put(entry->dmabuf);
+-
+ 		list_del(&entry->head);
+-		kfree(entry);
++		/* Imports from rknpu_mem.c; it frees them with the unlocked API. */
++		rknpu_mem_import_free(entry);
+ 	}
+ 
+ 	kfree(session);
+diff --git a/drivers/rknpu/src/rknpu_mem.c b/drivers/rknpu/src/rknpu_mem.c
+index d1629ea02e3a..677aa82bd858 100644
+--- a/drivers/rknpu/src/rknpu_mem.c
++++ b/drivers/rknpu/src/rknpu_mem.c
+@@ -337,6 +337,7 @@ struct rknpu_mem_buf {
+  * zeros -> job timeout, and librknnrt's RKNPU_MEM_SYNC failed with EINVAL.
+  */
+ static int rknpu_mem_import(struct rknpu_device *rknpu_dev,
++			    struct rknpu_session *session,
+ 			    struct rknpu_mem_create *args)
+ {
+ 	struct rknpu_mem_buf *buf;
+@@ -422,6 +423,16 @@ static int rknpu_mem_import(struct rknpu_device *rknpu_dev,
+ 	/* keep args->handle as passed in: librknnrt owns that fd */
+ 	args->iommu_domain_id = 0;	/* see Bug 55 rev 8 */
+ 
++	/*
++	 * Track the import on the session so rknpu_release() frees it when
++	 * the client closes /dev/rknpu without RKNPU_MEM_DESTROY (killed,
++	 * crashed, or stopped by its container runtime).  Untracked, the
++	 * mapping and the dma-buf reference outlived the process.
++	 */
++	spin_lock(&rknpu_dev->lock);
++	list_add_tail(&buf->mem.head, &session->list);
++	spin_unlock(&rknpu_dev->lock);
++
+ 	LOG_DEV_INFO(rknpu_dev->dev,
+ 		     "mem_import: fd=%u size=%zu dma_addr=%pad nents=%u obj=%px kv=%px\n",
+ 		     args->handle, buf->mem.size, &buf->mem.dma_addr,
+@@ -449,6 +460,12 @@ static void rknpu_mem_import_release(struct rknpu_mem_buf *buf)
+ 	kfree(buf);
+ }
+ 
++/* Free an import already taken off its session list. */
++void rknpu_mem_import_free(struct rknpu_mem_object *obj)
++{
++	rknpu_mem_import_release(container_of(obj, struct rknpu_mem_buf, mem));
++}
++
+ static int rknpu_mem_obj_mmap(struct file *filp, struct vm_area_struct *vma)
+ {
+ 	struct rknpu_mem_buf *buf = filp->private_data;
+@@ -515,7 +532,7 @@ int rknpu_mem_create_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
+ 
+ 	/* Bug 56: handle != 0 means "import this dma-buf fd", not "allocate". */
+ 	if (args.handle) {
+-		ret = rknpu_mem_import(rknpu_dev, &args);
++		ret = rknpu_mem_import(rknpu_dev, file->private_data, &args);
+ 		if (ret)
+ 			return ret;
+ 		if (copy_to_user((void __user *)data, &args, sizeof(args)))
+@@ -789,7 +806,8 @@ int rknpu_mem_destroy_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
+ 			    unsigned long data)
+ {
+ 	struct rknpu_mem_destroy args;
+-	struct rknpu_mem_buf *buf;
++	struct rknpu_session *session = file->private_data;
++	struct rknpu_mem_object *entry, *found = NULL;
+ 
+ 	if (copy_from_user(&args, (void __user *)data, sizeof(args)))
+ 		return -EFAULT;
+@@ -800,16 +818,26 @@ int rknpu_mem_destroy_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
+ 	if (!args.obj_addr)
+ 		return 0;
+ 
+-	buf = (struct rknpu_mem_buf *)(uintptr_t)args.obj_addr;
+-
+ 	/*
+ 	 * Bug 56: imported dma-bufs have no anon fd; tear them down here.
+-	 * Driver-allocated buffers (mem.dmabuf == NULL) are freed when
+-	 * librknnrt closes the anon fd (rknpu_mem_obj_release) — do NOT
+-	 * free them here or we double-free.
++	 * Driver-allocated buffers are freed when librknnrt closes the anon
++	 * fd (rknpu_mem_obj_release) — do NOT free them here or we
++	 * double-free.  Imports are on this session's list; anything else
++	 * (a driver-allocated buffer, a stale or foreign obj_addr) is left
++	 * alone, so the pointer from userspace is never dereferenced.
+ 	 */
+-	if (buf->mem.dmabuf)
+-		rknpu_mem_import_release(buf);
++	spin_lock(&rknpu_dev->lock);
++	list_for_each_entry(entry, &session->list, head) {
++		if ((uintptr_t)entry == (uintptr_t)args.obj_addr) {
++			list_del(&entry->head);
++			found = entry;
++			break;
++		}
++	}
++	spin_unlock(&rknpu_dev->lock);
++
++	if (found)
++		rknpu_mem_import_free(found);
+ 
+ 	return 0;
+ }

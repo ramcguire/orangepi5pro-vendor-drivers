@@ -1,0 +1,15 @@
+// The version here is hk's in mise.toml.
+amends "package://github.com/jdx/hk/releases/download/v2.11.1/hk@2.11.1#/Config.pkl"
+import "package://github.com/jdx/hk/releases/download/v2.11.1/hk@2.11.1#/Builtins.pkl"
+
+steps {
+  ["shellcheck"] = Builtins.shellcheck
+  ["actionlint"] = Builtins.actionlint
+  ["shebang_scripts_are_executable"] = Builtins.check_shebang_scripts_are_executable
+  ["executables_have_shebangs"] = Builtins.check_executables_have_shebangs
+  ["merge_conflict"] = Builtins.check_merge_conflict
+  ["case_conflict"] = Builtins.check_case_conflict
+  ["editorconfig"] = (Builtins.editorconfig_checker) {
+    exclude = List("userpatches/**/*.patch")
+  }
+}

@@ -1,0 +1,61 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", "helpers:pinGitHubActionDigests"],
+  "customManagers": [
+    {
+      "description": "A `# renovate:` line, then NAME=value (or declare -g NAME=tag:value), then an optional NAME_COMMIT=<sha> digest line",
+      "customType": "regex",
+      "managerFilePatterns": ["/^build\\.sh$/", "/^userpatches/config-opi5\\.conf$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: packageName=(?<packageName>\\S+))?\\n[^\\n=]*=(?:tag:)?(?<currentValue>\\S+)(?:\\n[A-Z_]+_COMMIT=(?<currentDigest>[0-9a-f]{40}))?"
+      ]
+    },
+    {
+      "description": "Images in mise.toml's [vars]: a `# renovate:` line, then name = \"image:tag@sha256:digest\". The builder's tag is a moving -latest, so only its digest updates. Renovate's own mise manager covers [tools].",
+      "customType": "regex",
+      "managerFilePatterns": ["/^mise\\.toml$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>docker) depName=(?<depName>\\S+)\\n\\w+ = \"[^:\"]+:(?<currentValue>[^@\"]+)@(?<currentDigest>sha256:[0-9a-f]{64})\""
+      ]
+    },
+    {
+      "description": "hk's Pkl package in hk.pkl: the version twice in each URL (download/vX.Y.Z/hk@X.Y.Z), kept the same as hk in mise.toml.",
+      "customType": "regex",
+      "managerFilePatterns": ["/^hk\\.pkl$/"],
+      "matchStrings": [
+        "github\\.com/jdx/hk/releases/download/v(?<currentValue>\\d+\\.\\d+\\.\\d+)/",
+        "/hk@(?<currentValue>\\d+\\.\\d+\\.\\d+)#"
+      ],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "jdx/hk",
+      "extractVersionTemplate": "^v(?<version>.+)$"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Armbian's tags: vX.Y.0-trunk.N builds lead up to the vX.Y.1 release. Older unprefixed tags don't match and are ignored.",
+      "matchDepNames": ["armbian/build"],
+      "versioning": "regex:^v(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)(?:-trunk\\.(?<build>\\d+))?$"
+    },
+    {
+      "description": "Stay on 6.18.y, the line Armbian's current branch builds. Leaving it is a port, not a bump.",
+      "matchDepNames": ["linux"],
+      "versioning": "regex:^v(?<major>6)\\.(?<minor>18)\\.(?<patch>\\d+)$"
+    },
+    {
+      "description": "One pull request moves the pair, so check.yml tests Armbian's patches and ours on the new kernel together. If the kernel is ahead of Armbian's patches, the check fails and the pull request waits for Armbian's next tag.",
+      "matchDepNames": ["armbian/build", "linux"],
+      "groupName": "Armbian and kernel"
+    },
+    {
+      "description": "Renovate releases several times a day; its image only runs renovate-check.",
+      "matchDepNames": ["ghcr.io/renovatebot/renovate"],
+      "schedule": ["* 0-5 1 * *"]
+    },
+    {
+      "description": "hk's binary (mise.toml) and its Pkl package (hk.pkl) move together.",
+      "matchDepNames": ["hk", "jdx/hk"],
+      "groupName": "hk"
+    }
+  ]
+}

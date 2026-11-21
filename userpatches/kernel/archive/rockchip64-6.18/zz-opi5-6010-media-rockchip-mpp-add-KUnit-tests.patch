@@ -1,0 +1,395 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: opi5 <noreply@example.invalid>
+Date: Fri, 20 Nov 2026 00:00:00 +0000
+Subject: [PATCH] media: rockchip: mpp: add KUnit tests
+
+mpp_kunit (ROCKCHIP_MPP_KUNIT_TEST) checks what the earlier patches rely on,
+with literal values rather than the driver's macros:
+
+- mpp_uapi: struct mpp_request (24 bytes) and its offsets, MPP_IOC_CFG_V1
+  (0x40047601), the command values and flags of rk-mpp.h (1010).
+- mpp_cmd: mpp_check_cmd_v1 accepts each group's commands from BASE to
+  BUTT - 1 and nothing else, for every command below 0x1000 and some above.
+- mpp_check_req: in range, below the base, at and past the end, straddling
+  the end (cut to what fits) and offset + size wrapping a u32 (4010).
+- rkvdec2_ccu_timeout: the thresholds at the 1080p and 4K boundaries and
+  8K, 0x59fffff from 4K (3010).
+
+mpp_check_cmd_v1 and rkvdec2_ccu_get_timeout_threshold are static unless
+CONFIG_KUNIT is on; then they and mpp_check_req are exported in the
+EXPORTED_FOR_KUNIT_TESTING namespace.
+---
+ drivers/media/platform/rockchip/mpp/Kconfig   |  11 +
+ drivers/media/platform/rockchip/mpp/Makefile  |   1 +
+ .../media/platform/rockchip/mpp/mpp_common.c  |   5 +-
+ .../media/platform/rockchip/mpp/mpp_common.h  |   4 +
+ .../media/platform/rockchip/mpp/mpp_kunit.c   | 234 ++++++++++++++++++
+ .../platform/rockchip/mpp/mpp_rkvdec2_link.c  |   4 +-
+ .../platform/rockchip/mpp/mpp_rkvdec2_link.h  |   5 +
+ 7 files changed, 262 insertions(+), 2 deletions(-)
+ create mode 100644 drivers/media/platform/rockchip/mpp/mpp_kunit.c
+
+diff --git a/drivers/media/platform/rockchip/mpp/Kconfig b/drivers/media/platform/rockchip/mpp/Kconfig
+index 262480802299..d53f12ce1f02 100644
+--- a/drivers/media/platform/rockchip/mpp/Kconfig
++++ b/drivers/media/platform/rockchip/mpp/Kconfig
+@@ -29,4 +29,15 @@ config ROCKCHIP_MPP_RKVENC2
+ 	help
+ 	  Bind both RK3588 RKVENC2 cores through the MPP request ABI.
+ 
++config ROCKCHIP_MPP_KUNIT_TEST
++	tristate "KUnit tests for the MPP service" if !KUNIT_ALL_TESTS
++	depends on KUNIT
++	default KUNIT_ALL_TESTS
++	help
++	  Tests for the request ABI, the ioctl command filter, the register
++	  request bounds and, with ROCKCHIP_MPP_RKVDEC2, the CCU timeout, as
++	  the mpp_kunit module. Loading it runs them and taints the kernel.
++	  With KUNIT on, the functions under test are exported in the
++	  EXPORTED_FOR_KUNIT_TESTING namespace.
++
+ endif
+diff --git a/drivers/media/platform/rockchip/mpp/Makefile b/drivers/media/platform/rockchip/mpp/Makefile
+index 3daf18d1399d..a900466b899c 100644
+--- a/drivers/media/platform/rockchip/mpp/Makefile
++++ b/drivers/media/platform/rockchip/mpp/Makefile
+@@ -7,3 +7,4 @@ rk_vcodec-y := mpp_service.o mpp_common.o mpp_iommu.o
+ rk_vcodec-$(CONFIG_ROCKCHIP_MPP_RKVDEC2) += mpp_rkvdec2.o mpp_rkvdec2_link.o
+ rk_vcodec-$(CONFIG_ROCKCHIP_MPP_RKVENC2) += mpp_rkvenc2.o
+ obj-$(CONFIG_ROCKCHIP_MPP_SERVICE) += rk_vcodec.o
++obj-$(CONFIG_ROCKCHIP_MPP_KUNIT_TEST) += mpp_kunit.o
+diff --git a/drivers/media/platform/rockchip/mpp/mpp_common.c b/drivers/media/platform/rockchip/mpp/mpp_common.c
+index 0161ddd21be3..9b09ae9a4f80 100644
+--- a/drivers/media/platform/rockchip/mpp/mpp_common.c
++++ b/drivers/media/platform/rockchip/mpp/mpp_common.c
+@@ -30,6 +30,7 @@
+ #include <linux/slab.h>
+ #include <linux/uaccess.h>
+ #include <linux/nospec.h>
++#include <kunit/visibility.h>
+ 
+ #include <soc/rockchip/pm_domains.h>
+ 
+@@ -1179,7 +1180,7 @@ static void mpp_detach_workqueue(struct mpp_dev *mpp)
+ 	}
+ }
+ 
+-static int mpp_check_cmd_v1(__u32 cmd)
++VISIBLE_IF_KUNIT int mpp_check_cmd_v1(__u32 cmd)
+ {
+ 	bool found;
+ 
+@@ -1191,6 +1192,7 @@ static int mpp_check_cmd_v1(__u32 cmd)
+ 
+ 	return found ? 0 : -EINVAL;
+ }
++EXPORT_SYMBOL_IF_KUNIT(mpp_check_cmd_v1);
+ 
+ static inline int mpp_msg_is_last(struct mpp_request *req)
+ {
+@@ -1968,6 +1970,7 @@ int mpp_check_req(struct mpp_request *req, int base,
+ 
+ 	return 0;
+ }
++EXPORT_SYMBOL_IF_KUNIT(mpp_check_req);
+ 
+ int mpp_extract_reg_offset_info(struct reg_offset_info *off_inf,
+ 				struct mpp_request *req)
+diff --git a/drivers/media/platform/rockchip/mpp/mpp_common.h b/drivers/media/platform/rockchip/mpp/mpp_common.h
+index c8202f56cada..70e855b7f548 100644
+--- a/drivers/media/platform/rockchip/mpp/mpp_common.h
++++ b/drivers/media/platform/rockchip/mpp/mpp_common.h
+@@ -635,6 +635,10 @@ int mpp_translate_reg_address(struct mpp_session *session,
+ 
+ int mpp_check_req(struct mpp_request *req, int base,
+ 		  int max_size, u32 off_s, u32 off_e);
++#if IS_ENABLED(CONFIG_KUNIT)
++/* Static without KUnit. */
++int mpp_check_cmd_v1(__u32 cmd);
++#endif
+ int mpp_extract_reg_offset_info(struct reg_offset_info *off_inf,
+ 				struct mpp_request *req);
+ int mpp_query_reg_offset_info(struct reg_offset_info *off_inf,
+diff --git a/drivers/media/platform/rockchip/mpp/mpp_kunit.c b/drivers/media/platform/rockchip/mpp/mpp_kunit.c
+new file mode 100644
+index 000000000000..325299419eb8
+--- /dev/null
++++ b/drivers/media/platform/rockchip/mpp/mpp_kunit.c
+@@ -0,0 +1,234 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * KUnit tests for the MPP service (rk_vcodec): the userspace request ABI, the ioctl
++ * command filter, the register request bounds and the RKVDEC2 CCU timeout.
++ *
++ * Expected values are literals, not the driver's macros, so a changed macro fails here.
++ */
++#include <kunit/test.h>
++#include <linux/stddef.h>
++#include <linux/string.h>
++
++#include "mpp_debug.h"
++#include "mpp_common.h"
++#if IS_ENABLED(CONFIG_ROCKCHIP_MPP_RKVDEC2)
++#include "mpp_rkvdec2_link.h"
++#endif
++
++MODULE_IMPORT_NS("EXPORTED_FOR_KUNIT_TESTING");
++
++/* include/uapi/linux/rk-mpp.h: what librockchip_mpp is built against. */
++static void mpp_uapi_request_layout(struct kunit *test)
++{
++	KUNIT_EXPECT_EQ(test, sizeof(struct mpp_request), (size_t)24);
++	KUNIT_EXPECT_EQ(test, offsetof(struct mpp_request, cmd), (size_t)0);
++	KUNIT_EXPECT_EQ(test, offsetof(struct mpp_request, flags), (size_t)4);
++	KUNIT_EXPECT_EQ(test, offsetof(struct mpp_request, size), (size_t)8);
++	KUNIT_EXPECT_EQ(test, offsetof(struct mpp_request, offset), (size_t)12);
++	KUNIT_EXPECT_EQ(test, offsetof(struct mpp_request, data), (size_t)16);
++	KUNIT_EXPECT_EQ(test, sizeof(struct mpp_bat_msg), (size_t)16);
++}
++
++static void mpp_uapi_ioctls(struct kunit *test)
++{
++	KUNIT_EXPECT_EQ(test, MPP_IOC_CFG_V1, 0x40047601U);
++	KUNIT_EXPECT_EQ(test, MPP_IOC_CFG_V2, 0x40047602U);
++}
++
++static void mpp_uapi_commands(struct kunit *test)
++{
++	KUNIT_EXPECT_EQ(test, MPP_CMD_QUERY_HW_SUPPORT, 0x000);
++	KUNIT_EXPECT_EQ(test, MPP_CMD_QUERY_HW_ID, 0x001);
++	KUNIT_EXPECT_EQ(test, MPP_CMD_QUERY_CMD_SUPPORT, 0x002);
++	KUNIT_EXPECT_EQ(test, MPP_CMD_INIT_CLIENT_TYPE, 0x100);
++	KUNIT_EXPECT_EQ(test, MPP_CMD_INIT_DRIVER_DATA, 0x101);
++	KUNIT_EXPECT_EQ(test, MPP_CMD_INIT_TRANS_TABLE, 0x102);
++	KUNIT_EXPECT_EQ(test, MPP_CMD_SET_REG_WRITE, 0x200);
++	KUNIT_EXPECT_EQ(test, MPP_CMD_SET_REG_READ, 0x201);
++	KUNIT_EXPECT_EQ(test, MPP_CMD_SET_REG_ADDR_OFFSET, 0x202);
++	KUNIT_EXPECT_EQ(test, MPP_CMD_SET_RCB_INFO, 0x203);
++	KUNIT_EXPECT_EQ(test, MPP_CMD_SET_SESSION_FD, 0x204);
++	KUNIT_EXPECT_EQ(test, MPP_CMD_POLL_HW_FINISH, 0x300);
++	KUNIT_EXPECT_EQ(test, MPP_CMD_POLL_HW_IRQ, 0x301);
++	KUNIT_EXPECT_EQ(test, MPP_CMD_RESET_SESSION, 0x400);
++	KUNIT_EXPECT_EQ(test, MPP_CMD_TRANS_FD_TO_IOVA, 0x401);
++	KUNIT_EXPECT_EQ(test, MPP_CMD_RELEASE_FD, 0x402);
++	KUNIT_EXPECT_EQ(test, MPP_CMD_SEND_CODEC_INFO, 0x403);
++}
++
++static void mpp_uapi_flags(struct kunit *test)
++{
++	KUNIT_EXPECT_EQ(test, MPP_FLAGS_MULTI_MSG, 0x00000001);
++	KUNIT_EXPECT_EQ(test, MPP_FLAGS_LAST_MSG, 0x00000002);
++	KUNIT_EXPECT_EQ(test, MPP_FLAGS_REG_FD_NO_TRANS, 0x00000004);
++	KUNIT_EXPECT_EQ(test, MPP_FLAGS_SCL_FD_NO_TRANS, 0x00000008);
++	KUNIT_EXPECT_EQ(test, MPP_FLAGS_REG_NO_OFFSET, 0x00000010);
++	KUNIT_EXPECT_EQ(test, MPP_FLAGS_SECURE_MODE, 0x00010000);
++	KUNIT_EXPECT_EQ(test, MPP_BAT_MSG_DONE, 0x00000001);
++}
++
++static struct kunit_case mpp_uapi_cases[] = {
++	KUNIT_CASE(mpp_uapi_request_layout),
++	KUNIT_CASE(mpp_uapi_ioctls),
++	KUNIT_CASE(mpp_uapi_commands),
++	KUNIT_CASE(mpp_uapi_flags),
++	{}
++};
++
++static struct kunit_suite mpp_uapi_suite = {
++	.name = "mpp_uapi",
++	.test_cases = mpp_uapi_cases,
++};
++
++/* The commands mpp_check_cmd_v1() lets through: each group from its base to its BUTT. */
++static bool mpp_cmd_known(u32 cmd)
++{
++	return cmd <= 0x002 ||
++	       (cmd >= 0x100 && cmd <= 0x102) ||
++	       (cmd >= 0x200 && cmd <= 0x204) ||
++	       (cmd >= 0x300 && cmd <= 0x301) ||
++	       (cmd >= 0x400 && cmd <= 0x403);
++}
++
++static void mpp_cmd_low_range(struct kunit *test)
++{
++	u32 cmd;
++
++	for (cmd = 0; cmd < 0x1000; cmd++)
++		KUNIT_EXPECT_EQ_MSG(test, mpp_check_cmd_v1(cmd),
++				    mpp_cmd_known(cmd) ? 0 : -EINVAL, "cmd 0x%x", cmd);
++}
++
++static void mpp_cmd_high(struct kunit *test)
++{
++	static const u32 cmds[] = { 0x1000, 0x10200, 0x7fffffff, 0x80000000, 0xfffffffe,
++				    0xffffffff };
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(cmds); i++)
++		KUNIT_EXPECT_EQ_MSG(test, mpp_check_cmd_v1(cmds[i]), -EINVAL,
++				    "cmd 0x%x", cmds[i]);
++}
++
++static struct kunit_case mpp_cmd_cases[] = {
++	KUNIT_CASE(mpp_cmd_low_range),
++	KUNIT_CASE(mpp_cmd_high),
++	{}
++};
++
++static struct kunit_suite mpp_cmd_suite = {
++	.name = "mpp_cmd",
++	.test_cases = mpp_cmd_cases,
++};
++
++/* A 0x40-byte register window at offset 0x100, the whole of it writable. */
++struct mpp_check_req_case {
++	const char *name;
++	u32 offset, size;
++	int ret;
++	u32 size_after;
++};
++
++static const struct mpp_check_req_case mpp_check_req_cases[] = {
++	{ "whole window", 0x100, 0x40, 0, 0x40 },
++	{ "inside", 0x110, 0x10, 0, 0x10 },
++	{ "last word", 0x13c, 0x4, 0, 0x4 },
++	{ "below the base", 0xfc, 0x8, -EINVAL },
++	{ "at the end", 0x140, 0x4, -EINVAL },
++	{ "past the end", 0x200, 0x4, -EINVAL },
++	/* Cut to what fits, not to the excess. */
++	{ "straddling the end", 0x130, 0x20, 0, 0x10 },
++	/* offset + size wraps a u32 to 4. */
++	{ "size wrapping a u32", 0x108, 0xfffffffc, 0, 0x38 },
++	/* Negative as an int, which passed every check in the BSP. */
++	{ "offset 2 GB", 0x80000000, 0x4, -EINVAL },
++	{ "offset 0xffffffff", 0xffffffff, 0x2, -EINVAL },
++};
++
++static void mpp_check_req_desc(const struct mpp_check_req_case *c, char *desc)
++{
++	strscpy(desc, c->name, KUNIT_PARAM_DESC_SIZE);
++}
++
++KUNIT_ARRAY_PARAM(mpp_check_req, mpp_check_req_cases, mpp_check_req_desc);
++
++static void mpp_check_req_bounds(struct kunit *test)
++{
++	const struct mpp_check_req_case *c = test->param_value;
++	struct mpp_request req = {
++		.cmd = 0x200,
++		.offset = c->offset,
++		.size = c->size,
++	};
++
++	KUNIT_EXPECT_EQ(test, mpp_check_req(&req, 0x100, 0x40, 0, 0x40), c->ret);
++	if (!c->ret)
++		KUNIT_EXPECT_EQ(test, req.size, c->size_after);
++}
++
++/* off_s: a request must reach it. off_e: must be inside the window. */
++static void mpp_check_req_window(struct kunit *test)
++{
++	struct mpp_request req = { .cmd = 0x200, .offset = 0x100, .size = 0x10 };
++
++	KUNIT_EXPECT_EQ(test, mpp_check_req(&req, 0x100, 0x40, 0x10, 0x40), 0);
++	KUNIT_EXPECT_EQ(test, mpp_check_req(&req, 0x100, 0x40, 0x11, 0x40), -EINVAL);
++	KUNIT_EXPECT_EQ(test, mpp_check_req(&req, 0x100, 0x40, 0, 0x41), -EINVAL);
++	KUNIT_EXPECT_EQ(test, mpp_check_req(&req, -1, 0x40, 0, 0x40), -EINVAL);
++	KUNIT_EXPECT_EQ(test, mpp_check_req(&req, 0x100, -1, 0, 0), -EINVAL);
++}
++
++static struct kunit_case mpp_check_req_test_cases[] = {
++	KUNIT_CASE_PARAM(mpp_check_req_bounds, mpp_check_req_gen_params),
++	KUNIT_CASE(mpp_check_req_window),
++	{}
++};
++
++static struct kunit_suite mpp_check_req_suite = {
++	.name = "mpp_check_req",
++	.test_cases = mpp_check_req_test_cases,
++};
++
++static void rkvdec2_ccu_timeout_thresholds(struct kunit *test)
++{
++#if IS_ENABLED(CONFIG_ROCKCHIP_MPP_RKVDEC2)
++	static const struct {
++		u32 pixels, threshold;
++	} cases[] = {
++		{ 0, 0xefffff },
++		{ 1920 * 1080 - 1, 0xefffff },
++		{ 1920 * 1080, 0x2cfffff },
++		{ 4096 * 2304 - 1, 0x2cfffff },
++		/* 120 ms at 786.432 MHz; the BSP's 0x4ffffff (106.7 ms) reset 4K streams. */
++		{ 4096 * 2304, 0x59fffff },
++		{ 7680 * 4320, 0x59fffff },
++	};
++	struct rkvdec2_task *task = kunit_kzalloc(test, sizeof(*task), GFP_KERNEL);
++	int i;
++
++	KUNIT_ASSERT_NOT_NULL(test, task);
++	for (i = 0; i < ARRAY_SIZE(cases); i++) {
++		task->pixels = cases[i].pixels;
++		KUNIT_EXPECT_EQ_MSG(test, rkvdec2_ccu_get_timeout_threshold(task),
++				    cases[i].threshold, "%u pixels", cases[i].pixels);
++	}
++#else
++	kunit_skip(test, "CONFIG_ROCKCHIP_MPP_RKVDEC2 is off");
++#endif
++}
++
++static struct kunit_case rkvdec2_ccu_timeout_cases[] = {
++	KUNIT_CASE(rkvdec2_ccu_timeout_thresholds),
++	{}
++};
++
++static struct kunit_suite rkvdec2_ccu_timeout_suite = {
++	.name = "rkvdec2_ccu_timeout",
++	.test_cases = rkvdec2_ccu_timeout_cases,
++};
++
++kunit_test_suites(&mpp_uapi_suite, &mpp_cmd_suite, &mpp_check_req_suite,
++		  &rkvdec2_ccu_timeout_suite);
++
++MODULE_DESCRIPTION("KUnit tests for the Rockchip MPP service");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/media/platform/rockchip/mpp/mpp_rkvdec2_link.c b/drivers/media/platform/rockchip/mpp/mpp_rkvdec2_link.c
+index 9175cae77fe4..ee69e5c558ba 100644
+--- a/drivers/media/platform/rockchip/mpp/mpp_rkvdec2_link.c
++++ b/drivers/media/platform/rockchip/mpp/mpp_rkvdec2_link.c
+@@ -10,6 +10,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/slab.h>
++#include <kunit/visibility.h>
+ #include <soc/rockchip/pm_domains.h>
+ 
+ #include "mpp_rkvdec2_link.h"
+@@ -1508,7 +1509,7 @@ void rkvdec2_link_session_deinit(struct mpp_session *session)
+  */
+ #define RKVDEC2_CCU_TIMEOUT_120MS	(0x59fffff)
+ 
+-static u32 rkvdec2_ccu_get_timeout_threshold(struct rkvdec2_task *task)
++VISIBLE_IF_KUNIT u32 rkvdec2_ccu_get_timeout_threshold(struct rkvdec2_task *task)
+ {
+ 	u32 pixels = task->pixels;
+ 
+@@ -1519,6 +1520,7 @@ static u32 rkvdec2_ccu_get_timeout_threshold(struct rkvdec2_task *task)
+ 	else
+ 		return RKVDEC2_CCU_TIMEOUT_120MS;
+ }
++EXPORT_SYMBOL_IF_KUNIT(rkvdec2_ccu_get_timeout_threshold);
+ 
+ int rkvdec2_attach_ccu(struct device *dev, struct rkvdec2_dev *dec)
+ {
+diff --git a/drivers/media/platform/rockchip/mpp/mpp_rkvdec2_link.h b/drivers/media/platform/rockchip/mpp/mpp_rkvdec2_link.h
+index a8796bf6078b..2419d71f0fe0 100644
+--- a/drivers/media/platform/rockchip/mpp/mpp_rkvdec2_link.h
++++ b/drivers/media/platform/rockchip/mpp/mpp_rkvdec2_link.h
+@@ -254,4 +254,9 @@ int rkvdec2_hard_ccu_iommu_fault_handle(struct iommu_domain *iommu,
+ /* for special handle */
+ int rkvdec_vdpu383_link_irq(struct mpp_dev *mpp);
+ 
++#if IS_ENABLED(CONFIG_KUNIT)
++/* Static without KUnit. */
++u32 rkvdec2_ccu_get_timeout_threshold(struct rkvdec2_task *task);
++#endif
++
+ #endif

@@ -1,0 +1,300 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: opi5 <noreply@example.invalid>
+Date: Fri, 20 Nov 2026 00:00:00 +0000
+Subject: [PATCH] media: rockchip: rga: add KUnit tests
+
+rga_kunit (ROCKCHIP_RGA_KUNIT_TEST), with literal values rather than the
+driver's macros:
+
+- rga_request: rga_request_check refuses id 0, no tasks or no task
+  pointer with -EINVAL and more than 256 tasks with -EFBIG.
+- rga_mm_sgt: a one-segment sg_table is accepted, two non-mergeable
+  segments are -EOPNOTSUPP (2010's single-base rule).
+
+rga3.ko fails to load without RGA cores (rga_iommu_bind returns -EFAULT),
+so a test module that needs it can't run in QEMU. Both checks become
+static inlines in the headers instead, rga_request_check moved from
+rga_job.c and the nents check of rga_mm_map_virt_addr as
+rga_mm_check_sgt_single_base, and rga_kunit includes them. The driver
+compiles the same code.
+---
+ .../media/platform/rockchip/rga/rga3/Kconfig  | 10 ++
+ .../media/platform/rockchip/rga/rga3/Makefile |  1 +
+ .../rockchip/rga/rga3/include/rga_job.h       | 28 +++++-
+ .../rockchip/rga/rga3/include/rga_mm.h        | 21 +++++
+ .../platform/rockchip/rga/rga3/rga_job.c      | 26 ------
+ .../platform/rockchip/rga/rga3/rga_kunit.c    | 91 +++++++++++++++++++
+ .../media/platform/rockchip/rga/rga3/rga_mm.c | 18 +---
+ 7 files changed, 152 insertions(+), 43 deletions(-)
+ create mode 100644 drivers/media/platform/rockchip/rga/rga3/rga_kunit.c
+
+diff --git a/drivers/media/platform/rockchip/rga/rga3/Kconfig b/drivers/media/platform/rockchip/rga/rga3/Kconfig
+index ce87ffea12f7..89f07d4b87dd 100644
+--- a/drivers/media/platform/rockchip/rga/rga3/Kconfig
++++ b/drivers/media/platform/rockchip/rga/rga3/Kconfig
+@@ -58,4 +58,14 @@ config ROCKCHIP_RGA_CMD_BUF_COUNT
+ 	  This option configures the number of command buffers (cmd_buf) that are
+ 	  pre-allocated by the RGA driver during initialization.
+ 
++config ROCKCHIP_RGA_KUNIT_TEST
++	tristate "KUnit tests for the multi-RGA driver" if !KUNIT_ALL_TESTS
++	depends on KUNIT
++	default KUNIT_ALL_TESTS
++	help
++	  Tests for the RGA request filter and the one-base-address rule for
++	  IOMMU-type cores, as the rga_kunit module. Loading it runs them and
++	  taints the kernel. It doesn't need rga3.ko, which only loads on
++	  a board with RGA cores.
++
+ endif
+diff --git a/drivers/media/platform/rockchip/rga/rga3/Makefile b/drivers/media/platform/rockchip/rga/rga3/Makefile
+index ccc68c7990dd..2cf1d23a4e78 100644
+--- a/drivers/media/platform/rockchip/rga/rga3/Makefile
++++ b/drivers/media/platform/rockchip/rga/rga3/Makefile
+@@ -7,3 +7,4 @@ rga3-$(CONFIG_ROCKCHIP_RGA_ASYNC) += rga_fence.o
+ rga3-$(CONFIG_ROCKCHIP_RGA_DEBUGGER) += rga_debugger.o
+ 
+ obj-$(CONFIG_ROCKCHIP_MULTI_RGA)	+= rga3.o
++obj-$(CONFIG_ROCKCHIP_RGA_KUNIT_TEST)	+= rga_kunit.o
+diff --git a/drivers/media/platform/rockchip/rga/rga3/include/rga_job.h b/drivers/media/platform/rockchip/rga/rga3/include/rga_job.h
+index 67d16649aaf4..0dac131f3653 100644
+--- a/drivers/media/platform/rockchip/rga/rga3/include/rga_job.h
++++ b/drivers/media/platform/rockchip/rga/rga3/include/rga_job.h
+@@ -12,6 +12,7 @@
+ #include <linux/dma-fence.h>
+ 
+ #include "rga_drv.h"
++#include "rga_common.h"
+ 
+ enum job_flags {
+ 	RGA_JOB_DONE			= 1 << 0,
+@@ -31,7 +32,32 @@ int rga_job_mpi_commit(struct rga_req *rga_command_base, struct rga_request *req
+ int rga_job_assign(struct rga_job *job);
+ 
+ 
+-int rga_request_check(struct rga_user_request *req);
++/* Inline, so rga_kunit tests it without rga3.ko, which needs RGA cores to load. */
++static inline int rga_request_check(struct rga_user_request *req)
++{
++	if (req->id <= 0) {
++		rga_err("ID[%d]: request_id is invalid", req->id);
++		return -EINVAL;
++	}
++
++	if (req->task_num <= 0) {
++		rga_err("ID[%d]: invalid user request!\n", req->id);
++		return -EINVAL;
++	}
++
++	if (req->task_ptr == 0) {
++		rga_err("ID[%d]: task_ptr is NULL!\n", req->id);
++		return -EINVAL;
++	}
++
++	if (req->task_num > RGA_TASK_NUM_MAX) {
++		rga_err("ID[%d]: Only supports running %d tasks, now %d\n",
++			req->id, RGA_TASK_NUM_MAX, req->task_num);
++		return -EFBIG;
++	}
++
++	return 0;
++}
+ struct rga_request *rga_request_lookup(struct rga_pending_request_manager *request_manager,
+ 				       uint32_t id);
+ 
+diff --git a/drivers/media/platform/rockchip/rga/rga3/include/rga_mm.h b/drivers/media/platform/rockchip/rga/rga3/include/rga_mm.h
+index bddb05c9454b..c4f828c6e58e 100644
+--- a/drivers/media/platform/rockchip/rga/rga3/include/rga_mm.h
++++ b/drivers/media/platform/rockchip/rga/rga3/include/rga_mm.h
+@@ -64,4 +64,25 @@ int rga_mm_session_release_buffer(struct rga_session *session);
+ int rga_mm_init(struct rga_mm **session);
+ int rga_mm_remove(struct rga_mm **session);
+ 
++/*
++ * RGA3/RGA2 IOMMU-type cores program exactly one base address
++ * per plane; they have no per-job scatter-gather descriptor.
++ * rga_dma_map_sgt() can still return more than one DMA segment
++ * for a user virtual-address buffer whose physical pages this
++ * IOMMU backend did not coalesce into a single IOVA run (seen
++ * even with an unbounded dma_max_seg_size for buffers with
++ * enough physical scatter). Treating buffer->dma_addr as the
++ * base of the whole buffer would then be wrong for any byte
++ * past the first segment, and the core's internal MMU/TLB
++ * faults on the resulting bad address mid-job, forcing a
++ * hardware reset. Reject in software instead of letting that
++ * reach hardware.
++ *
++ * Inline, so rga_kunit tests it without rga3.ko, which needs RGA cores to load.
++ */
++static inline int rga_mm_check_sgt_single_base(const struct sg_table *sgt)
++{
++	return sgt->nents > 1 ? -EOPNOTSUPP : 0;
++}
++
+ #endif
+diff --git a/drivers/media/platform/rockchip/rga/rga3/rga_job.c b/drivers/media/platform/rockchip/rga/rga3/rga_job.c
+index 2d5b5c44968c..9f36e58f0b9b 100644
+--- a/drivers/media/platform/rockchip/rga/rga3/rga_job.c
++++ b/drivers/media/platform/rockchip/rga/rga3/rga_job.c
+@@ -606,32 +606,6 @@ static int rga_request_add_acquire_fence_callback(int acquire_fence_fd,
+ 	return 0;
+ }
+ 
+-int rga_request_check(struct rga_user_request *req)
+-{
+-	if (req->id <= 0) {
+-		rga_err("ID[%d]: request_id is invalid", req->id);
+-		return -EINVAL;
+-	}
+-
+-	if (req->task_num <= 0) {
+-		rga_err("ID[%d]: invalid user request!\n", req->id);
+-		return -EINVAL;
+-	}
+-
+-	if (req->task_ptr == 0) {
+-		rga_err("ID[%d]: task_ptr is NULL!\n", req->id);
+-		return -EINVAL;
+-	}
+-
+-	if (req->task_num > RGA_TASK_NUM_MAX) {
+-		rga_err("ID[%d]: Only supports running %d tasks, now %d\n",
+-			req->id, RGA_TASK_NUM_MAX, req->task_num);
+-		return -EFBIG;
+-	}
+-
+-	return 0;
+-}
+-
+ struct rga_request *rga_request_lookup(struct rga_pending_request_manager *manager, uint32_t id)
+ {
+ 	struct rga_request *request = NULL;
+diff --git a/drivers/media/platform/rockchip/rga/rga3/rga_kunit.c b/drivers/media/platform/rockchip/rga/rga3/rga_kunit.c
+new file mode 100644
+index 000000000000..690a7f0501cf
+--- /dev/null
++++ b/drivers/media/platform/rockchip/rga/rga3/rga_kunit.c
+@@ -0,0 +1,91 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * KUnit tests for the multi-RGA driver (rga3): the request filter, and the rule that an
++ * IOMMU-type core gets one base address per buffer.
++ *
++ * Expected values are literals, not the driver's macros, so a changed macro fails here.
++ */
++#include <kunit/test.h>
++#include <linux/scatterlist.h>
++#include <linux/string.h>
++
++#include "rga.h"
++#include "rga_job.h"
++#include "rga_mm.h"
++
++struct rga_request_case {
++	const char *name;
++	u64 task_ptr;
++	u32 task_num, id;
++	int ret;
++};
++
++static const struct rga_request_case rga_request_cases[] = {
++	{ "one task", 0x1000, 1, 1, 0 },
++	{ "256 tasks", 0x1000, 256, 7, 0 },
++	{ "id 0", 0x1000, 1, 0, -EINVAL },
++	{ "no tasks", 0x1000, 0, 1, -EINVAL },
++	{ "no task pointer", 0, 1, 1, -EINVAL },
++	{ "257 tasks", 0x1000, 257, 1, -EFBIG },
++	{ "0xffffffff tasks", 0x1000, 0xffffffff, 1, -EFBIG },
++};
++
++static void rga_request_desc(const struct rga_request_case *c, char *desc)
++{
++	strscpy(desc, c->name, KUNIT_PARAM_DESC_SIZE);
++}
++
++KUNIT_ARRAY_PARAM(rga_request, rga_request_cases, rga_request_desc);
++
++static void rga_request_filter(struct kunit *test)
++{
++	const struct rga_request_case *c = test->param_value;
++	struct rga_user_request req = {
++		.task_ptr = c->task_ptr,
++		.task_num = c->task_num,
++		.id = c->id,
++	};
++
++	KUNIT_EXPECT_EQ(test, rga_request_check(&req), c->ret);
++}
++
++static struct kunit_case rga_request_test_cases[] = {
++	KUNIT_CASE_PARAM(rga_request_filter, rga_request_gen_params),
++	{}
++};
++
++static struct kunit_suite rga_request_suite = {
++	.name = "rga_request",
++	.test_cases = rga_request_test_cases,
++};
++
++static void rga_mm_sgt_segments(struct kunit *test)
++{
++	struct sg_table sgt;
++
++	KUNIT_ASSERT_EQ(test, sg_alloc_table(&sgt, 1, GFP_KERNEL), 0);
++	KUNIT_EXPECT_EQ(test, rga_mm_check_sgt_single_base(&sgt), 0);
++	sg_free_table(&sgt);
++
++	KUNIT_ASSERT_EQ(test, sg_alloc_table(&sgt, 2, GFP_KERNEL), 0);
++	KUNIT_EXPECT_EQ(test, rga_mm_check_sgt_single_base(&sgt), -EOPNOTSUPP);
++	/* Two pages that dma_map_sg() merged into one IOVA run have one base again. */
++	sgt.nents = 1;
++	KUNIT_EXPECT_EQ(test, rga_mm_check_sgt_single_base(&sgt), 0);
++	sg_free_table(&sgt);
++}
++
++static struct kunit_case rga_mm_sgt_cases[] = {
++	KUNIT_CASE(rga_mm_sgt_segments),
++	{}
++};
++
++static struct kunit_suite rga_mm_sgt_suite = {
++	.name = "rga_mm_sgt",
++	.test_cases = rga_mm_sgt_cases,
++};
++
++kunit_test_suites(&rga_request_suite, &rga_mm_sgt_suite);
++
++MODULE_DESCRIPTION("KUnit tests for the Rockchip multi-RGA driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/media/platform/rockchip/rga/rga3/rga_mm.c b/drivers/media/platform/rockchip/rga/rga3/rga_mm.c
+index 7a4fadd99a05..1f6650a6b420 100644
+--- a/drivers/media/platform/rockchip/rga/rga3/rga_mm.c
++++ b/drivers/media/platform/rockchip/rga/rga3/rga_mm.c
+@@ -625,25 +625,11 @@ static int rga_mm_map_virt_addr(struct rga_external_buffer *external_buffer,
+ 	}
+ 
+ 	if (scheduler->data->mmu == RGA_IOMMU) {
+-		/*
+-		 * RGA3/RGA2 IOMMU-type cores program exactly one base address
+-		 * per plane; they have no per-job scatter-gather descriptor.
+-		 * rga_dma_map_sgt() can still return more than one DMA segment
+-		 * for a user virtual-address buffer whose physical pages this
+-		 * IOMMU backend did not coalesce into a single IOVA run (seen
+-		 * even with an unbounded dma_max_seg_size for buffers with
+-		 * enough physical scatter). Treating buffer->dma_addr as the
+-		 * base of the whole buffer would then be wrong for any byte
+-		 * past the first segment, and the core's internal MMU/TLB
+-		 * faults on the resulting bad address mid-job, forcing a
+-		 * hardware reset. Reject in software instead of letting that
+-		 * reach hardware.
+-		 */
+-		if (sgt->nents > 1) {
++		ret = rga_mm_check_sgt_single_base(sgt);
++		if (ret) {
+ 			rga_err("%s core[%d] rejecting virt-addr buffer va = 0x%lx: dma_map_sg produced %d non-mergeable segments (orig_nents = %d), cannot be given one hardware base address\n",
+ 				__func__, scheduler->core,
+ 				(unsigned long)virt_addr->addr, sgt->nents, sgt->orig_nents);
+-			ret = -EOPNOTSUPP;
+ 			goto unmap_dma_buffer;
+ 		}
+ 

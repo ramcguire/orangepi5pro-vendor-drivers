@@ -1,0 +1,97 @@
+# Linux work runs in Armbian's builder image, so the host needs only mise and Docker.
+# Arguments after `--` go to the script.
+#
+# State is in Docker volumes, as a kernel tree needs a fast, case-sensitive filesystem,
+# which bind mounts on macOS and Windows aren't. OPI5_ARMBIAN_VOLUME and OPI5_WORK_VOLUME
+# override them with a volume name or an absolute host path.
+
+[tools]
+actionlint = "1.7.12"
+editorconfig-checker = "4.0.2"
+# The same version as hk.pkl's package URLs.
+hk = "2.11.1"
+shellcheck = "0.11.0"
+
+[vars]
+# renovate: datasource=docker depName=ghcr.io/armbian/docker-armbian-build
+builder = "ghcr.io/armbian/docker-armbian-build:armbian-debian-trixie-latest@sha256:9f996ac2caf2a6ba697f372cfcfa6342113f7615ce1ec63d462d960983a0cef6"
+# renovate: datasource=docker depName=ghcr.io/renovatebot/renovate
+renovate = "ghcr.io/renovatebot/renovate:44.252.7@sha256:da2082c34a7e8aee0fbf50122d71a052ba32ea5f51aeded502b742ad7bc9d5a2"
+# /opi5/armbian, not /armbian: the image has files there, which Docker would copy into
+# the empty volume.
+# CCACHE_DIR: unset otherwise when compile.sh runs directly, so ccache would write inside
+# the container.
+# --privileged: compile.sh mounts tmpfs.
+docker = """\
+docker run --rm \
+--user 0 \
+--privileged \
+--entrypoint bash \
+--workdir /src \
+--mount "type=bind,source={{config_root}},target=/src" \
+--volume "{{get_env(name='OPI5_ARMBIAN_VOLUME', default='opi5-armbian')}}:/opi5/armbian" \
+--volume "{{get_env(name='OPI5_WORK_VOLUME', default='opi5-work')}}:/work" \
+--env ARMBIAN_DIR=/opi5/armbian \
+--env OUT_DIR=/src/out \
+--env CCACHE_DIR=/opi5/armbian/cache/ccache \
+--env KERNEL_GIT \
+--env ARMBIAN_RUNNING_IN_CONTAINER=yes \
+--env GIT_CONFIG_COUNT=1 \
+--env GIT_CONFIG_KEY_0=safe.directory \
+"--env=GIT_CONFIG_VALUE_0=*"\
+"""
+
+[tasks.build]
+description = "Build the kernel packages into out/ (Armbian in its builder image, with ccache)"
+run = "{{vars.docker}} {{vars.builder}} ./build.sh ENABLE_EXTENSIONS=ccache"
+
+[tasks.modules]
+description = "Build only rk_vcodec.ko, rga3.ko, rknpu.ko, their KUnit tests and the board DTB into out/drivers/"
+run = "{{vars.docker}} {{vars.builder}} tools/modules.sh /work/kernel /work/build"
+
+[tasks.check]
+description = "Apply all patches with Armbian's patcher (tools/patch.sh), then compile the drivers and DTB from that tree"
+run = [
+  "{{vars.docker}} {{vars.builder}} tools/patch.sh /work/check",
+  "{{vars.docker}} --env OUT_DIR=/work/check-out {{vars.builder}} tools/modules.sh /work/check /work/check-build",
+]
+
+[tasks.bump-report]
+description = "Markdown report on the last check: Armbian patches failed or next to ours, new NPU source commits, config drift (tools/bump-report.sh)"
+run = "{{vars.docker}} {{vars.builder}} tools/bump-report.sh /work/check-build"
+
+[tasks.kunit]
+description = "Run the built kernel package's KUnit suites in QEMU (tools/kunit.sh); results in out/kunit/"
+run = "{{vars.docker}} {{vars.builder}} tools/kunit.sh"
+
+[tasks.tests]
+description = "Build the abuse tests (tests/*.c) as static arm64 binaries into out/tests/"
+# Skipped while out/tests/ is newer than the sources, so no container starts.
+sources = ["tests/*.c", "tests/Makefile"]
+outputs = ["out/tests/*"]
+# The chown: make runs as root in the container.
+run = "{{vars.docker}} {{vars.builder}} -c \"make -C tests && chown -R --reference=. out/tests\""
+
+[tasks.queue-import]
+description = "Import the patches as commits in the opi5-work volume, from Armbian's patcher (tools/queue.sh)"
+run = "{{vars.docker}} {{vars.builder}} tools/queue.sh import /work/kernel"
+
+[tasks.queue-export]
+description = "Write the queue's commits back to userpatches/ (tools/queue.sh)"
+run = "{{vars.docker}} {{vars.builder}} tools/queue.sh export /work/kernel"
+
+[tasks.shell]
+description = "A shell in the builder image: the repository in /src, the queue in /work/kernel"
+run = "{{vars.docker}} --interactive --tty {{vars.builder}}"
+
+[tasks.lint]
+description = "hk's checks (hk.pkl) on every file: shellcheck, actionlint, executable bits, .editorconfig"
+run = "hk check --all"
+
+[tasks.renovate-check]
+description = "Validate renovate.json (in Renovate's image)"
+run = "docker run --rm --mount \"type=bind,source={{config_root}},target=/src,readonly\" --workdir /src --entrypoint renovate-config-validator {{vars.renovate}} --strict"
+
+[tasks.clean]
+description = "Delete the opi5-armbian and opi5-work volumes (caches, checkouts, queue)"
+run = "docker volume rm opi5-armbian opi5-work"
