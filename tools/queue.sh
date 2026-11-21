@@ -56,7 +56,7 @@ import() {
 
 	ARMBIAN_DIR=$armbian bash "$here/tools/patch.sh"
 	rm -rf "$tree"
-	bare=$armbian/cache/git-bare/kernel
+	bare=$(bash "$here/tools/kernel-git.sh" "$armbian")
 	ref=refs/opi5/patched
 
 	# Newest first: the device tree commits, ours, then Armbian's. ours is the depth of our

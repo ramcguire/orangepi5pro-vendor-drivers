@@ -5,7 +5,7 @@
 #
 # Fails if our board .dts isn't Armbian's above our includes, if a patch doesn't apply, or
 # if one of ours needs an offset or fuzz. Each patch becomes a commit; the result is kept
-# as refs/opi5/patched in Armbian's kernel git cache (a build resets Armbian's own branch)
+# as refs/opi5/patched in Armbian's kernel git (tools/kernel-git.sh; a build resets its branch)
 # and reused while Armbian's patch hashes stay the same. Delete cache/opi5-patch.key to
 # force a run.
 #
@@ -25,7 +25,6 @@ patchdirs=("$here"/userpatches/kernel/archive/rockchip64-*)
 family=${patchdirs[0]##*/}
 family=${family%-*}
 branch=kernel-$family-$(sed -n 's/^declare -g KERNELBRANCH=tag:v\([0-9]*\.[0-9]*\).*/\1/p' "$conf")
-bare=$armbian/cache/git-bare/kernel
 keyfile=$armbian/cache/opi5-patch.key
 ref=refs/opi5/patched
 
@@ -94,7 +93,10 @@ rm -f "$dump.log"
 key=$(grep -oE '(git revision|drivers hash|patches hash) \\"[^\\]*\\"' "$dump" | tr -d '\\"' | paste -sd' ')
 [[ $key == "git revision "*" drivers hash "*" patches hash "* ]] ||
 	{ echo "patch.sh: no patch hashes in Armbian's artifact version: $(head -c 500 "$dump")" >&2; exit 1; }
-tip=$(git -C "$bare" rev-parse -q --verify "$ref" 2> /dev/null || true)
+# No worktree yet (a fresh cache): no tip, so it runs.
+bare=$(bash "$here/tools/kernel-git.sh" "$armbian" 2> /dev/null || true)
+tip=
+if [[ -n $bare ]]; then tip=$(git -C "$bare" rev-parse -q --verify "$ref" 2> /dev/null || true); fi
 if [[ -n $tip && -f $keyfile && $(head -n1 "$keyfile") == "$tip $key" ]]; then
 	tail -n +2 "$keyfile"
 	echo "(cached: same $key as the last passing run; delete $keyfile to rerun it)"
@@ -104,6 +106,7 @@ else
 	messages=$(mktemp)
 	trap 'rm -f "$dump" "$stamp" "$messages"' EXIT
 	(cd "$armbian" && ./compile.sh opi5 kernel-patches-to-git "$@")
+	bare=$(bash "$here/tools/kernel-git.sh" "$armbian")
 	# For tools/bump-report.sh, which reads a failed run too.
 	git -C "$bare" update-ref refs/opi5/attempt "refs/heads/$branch"
 	status=0

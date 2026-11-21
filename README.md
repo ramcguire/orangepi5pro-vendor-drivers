@@ -102,5 +102,3 @@ The thousands digit is the purpose.
 ## License
 
 GPL-2.0, as Armbian ([LICENSE](LICENSE)). The kernel files keep their own SPDX headers: MPP and the device tree `(GPL-2.0+ OR MIT)`, `rk-mpp.h` with the Linux-syscall-note, RGA and RKNPU `GPL-2.0`, the NPU dtsi `GPL-2.0-only`.
-
-**Source**, as Armbian provides it: a release's source is this repository at its tag. That pins the kernel.org tag, Armbian's commit (its patches and fetched driver sources) and our patches; `build.sh` rebuilds the packages from them. The config ships as `/boot/config-<release>`.

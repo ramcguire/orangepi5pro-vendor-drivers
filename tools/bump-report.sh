@@ -29,7 +29,7 @@ done
 patchdirs=("$here"/userpatches/kernel/archive/rockchip64-*)
 dir=${patchdirs[0]##*/}
 kernel=$(sed -n 's/^declare -g KERNELBRANCH=tag:v//p' "$conf")
-bare=$armbian/cache/git-bare/kernel
+bare=$(bash "$here/tools/kernel-git.sh" "$armbian" 2> /dev/null || true)
 # The symbols whose drift matters for our drivers and for hangs.
 symbols='ROCKCHIP|RK_|RKNPU|RGA|MPP|IOMMU|DEVFREQ|DMA_HEAP|DMABUF|LOCKUP|HUNG_TASK|WQ_WATCHDOG|RCU_CPU_STALL'
 
@@ -53,7 +53,7 @@ echo
 
 ref=
 for r in refs/opi5/attempt refs/opi5/patched; do
-	if git -C "$bare" rev-parse -q --verify "$r" > /dev/null 2>&1; then ref=$r; break; fi
+	if [[ -n $bare ]] && git -C "$bare" rev-parse -q --verify "$r" > /dev/null 2>&1; then ref=$r; break; fi
 done
 base=
 if [[ -n $ref ]]; then
@@ -62,7 +62,7 @@ if [[ -n $ref ]]; then
 	base=$(git -C "$bare" log --format='%H %s' -n 2000 "$ref" | awk -v v="$kernel" '!b && $2 == "Linux" && $3 == v { b = $1 } END { print b }')
 fi
 if [[ -z $base ]]; then
-	echo "No patching run of Linux $kernel in $bare: run \`mise run check\` first. Sections 1 and 2 skipped."
+	echo "No patching run of Linux $kernel in Armbian's kernel git (${bare:-no worktree yet}): run \`mise run check\` first. Sections 1 and 2 skipped."
 	echo
 else
 	# One line per file each patch commit touches: user or core, the patch, the file.
