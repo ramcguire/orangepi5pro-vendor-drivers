@@ -13,3 +13,12 @@ steps {
     exclude = List("userpatches/**/*.patch")
   }
 }
+
+// Conventional Commits (https://www.conventionalcommits.org): <type>(<scope>)!: <description>.
+hooks {
+  ["commit-msg"] {
+    steps {
+      ["conventional_commit"] = Builtins.check_conventional_commit
+    }
+  }
+}

@@ -1,0 +1,28 @@
+# git-cliff (https://git-cliff.org): the changes section of the release notes
+# (tools/release-notes.sh), from conventional commits. CI and docs commits are left out.
+
+[changelog]
+body = """
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim }}
+{% for commit in commits %}
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message | upper_first }}{% if commit.breaking %} (**breaking**){% endif %} ({{ commit.id | truncate(length=12, end="") }})
+{%- endfor %}
+{% endfor %}
+"""
+trim = true
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+# The HTML comments order the groups and are stripped from the headings. CI changes don't
+# change the packages.
+commit_parsers = [
+  { message = "^\\w+\\(ci\\)", skip = true },
+  { message = "^feat", group = "<!-- 0 -->Features" },
+  { message = "^fix", group = "<!-- 1 -->Fixes" },
+  { message = "^perf", group = "<!-- 2 -->Performance" },
+  { message = "^revert", group = "<!-- 3 -->Reverts" },
+  { message = "^(build|chore)\\(deps\\)", group = "<!-- 4 -->Dependencies" },
+  { message = ".*", skip = true },
+]

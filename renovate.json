@@ -1,6 +1,7 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended", "helpers:pinGitHubActionDigests"],
+  "semanticCommits": "enabled",
   "customManagers": [
     {
       "description": "A `# renovate:` line, then NAME=value (or declare -g NAME=tag:value), then an optional NAME_COMMIT=<sha> digest line",
@@ -43,9 +44,10 @@
       "versioning": "regex:^v(?<major>6)\\.(?<minor>18)\\.(?<patch>\\d+)$"
     },
     {
-      "description": "One pull request moves the pair, so check.yml tests Armbian's patches and ours on the new kernel together. If the kernel is ahead of Armbian's patches, the check fails and the pull request waits for Armbian's next tag.",
+      "description": "One pull request moves the pair, so check.yml tests Armbian's patches and ours on the new kernel together. If the kernel is ahead of Armbian's patches, the check fails and the pull request waits for Armbian's next tag. Opened on Tuesdays, after Armbian's Monday tag, for one release a week (release.yml).",
       "matchDepNames": ["armbian/build", "linux"],
-      "groupName": "Armbian and kernel"
+      "groupName": "Armbian and kernel",
+      "schedule": ["* * * * 2"]
     },
     {
       "description": "Renovate releases several times a day; its image only runs renovate-check.",

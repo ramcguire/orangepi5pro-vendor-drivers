@@ -35,7 +35,7 @@ The packages carry the names of Armbian's kernel, so hold them, or Armbian's rep
 - `queue-import`, `queue-export`, `shell`: edit the patches as git commits (`tools/queue.sh`). Rewrite them in `mise run shell`, then export.
 - `lint`, `renovate-check`, `clean`.
 
-**CI.** `check.yml` runs `check` on every push. A tag `v<kernel>-<n>` runs `build.yml`, which builds, runs `kunit`, and publishes a release.
+**CI.** `check.yml` runs `check` on every push. Commits follow [Conventional Commits](https://www.conventionalcommits.org): hk checks them locally, and `pr-title.yml` checks pull request titles, as pull requests are squash-merged. On `main`, `release.yml` releases when `userpatches/`, `build.sh` or the builder image changed: `build.yml` builds and runs `kunit`, then tags `v<kernel>-<n>` and publishes the release, with notes from the commits (`cliff.toml`). A tag pushed by hand releases too.
 
 **Bumps** follow Armbian's tags. Renovate moves the Armbian tag and the 6.18.y kernel tag together in one pull request, and we don't patch ahead of Armbian. On those pull requests, `check.yml` adds `tools/bump-report.sh`'s report:
 - Armbian patches that failed;

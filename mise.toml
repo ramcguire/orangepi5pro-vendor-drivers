@@ -8,6 +8,8 @@
 [tools]
 actionlint = "1.7.12"
 editorconfig-checker = "4.0.2"
+# Release notes (cliff.toml).
+git-cliff = "2.14.2"
 # The same version as hk.pkl's package URLs.
 hk = "2.11.1"
 shellcheck = "0.11.0"

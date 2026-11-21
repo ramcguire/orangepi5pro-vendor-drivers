@@ -1,0 +1,49 @@
+# On each push to main, releases if what the packages are built from changed
+# (tools/release-plan.sh): build.yml builds and runs KUnit, then creates the tag and the
+# release, so a tag never points at a failed build.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One at a time, so each plans against the tags of the last.
+concurrency:
+  group: release
+
+env:
+  MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Plan
+        id: plan
+        run: |
+          status=0
+          tools/release-plan.sh > "$RUNNER_TEMP/plan" 2> "$RUNNER_TEMP/why" || status=$?
+          cat "$RUNNER_TEMP/why" "$RUNNER_TEMP/plan"
+          [[ $status -eq 0 ]] || exit "$status"
+          cat "$RUNNER_TEMP/plan" >> "$GITHUB_OUTPUT"
+          cat "$RUNNER_TEMP/why" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.tag != ''
+    uses: ./.github/workflows/build.yml
+    with:
+      tag: ${{ needs.plan.outputs.tag }}
+    permissions:
+      contents: write

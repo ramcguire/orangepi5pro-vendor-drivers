@@ -89,6 +89,7 @@ fi
 # The extension's check, with stand-ins for the Armbian functions it calls.
 exit_with_error() { echo "modules.sh: $*" >&2; exit 1; }
 display_alert() { echo "$1: $2"; }
+# shellcheck disable=SC2034 # Read by the extension's check.
 kernel_work_dir=$build
 pre_package_kernel_image__opi5_check_config
 

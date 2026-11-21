@@ -1,8 +1,15 @@
-# A tag v<kernel>-<revision> (e.g. v6.18.63-1) also publishes a release.
+# Builds the packages and runs KUnit. With a tag v<kernel>-<n> (e.g. v6.18.63-1), also
+# publishes a release: the tag release.yml picked, which creates it, or one pushed by hand.
 name: Build
 
 on:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      tag:
+        description: The release tag to create, v<kernel>-<n>
+        type: string
+        required: true
   push:
     tags: ["v*"]
 
@@ -17,6 +24,7 @@ env:
   # A host path, not a volume, so actions/cache can keep ccache.
   OPI5_ARMBIAN_VOLUME: ${{ github.workspace }}/work/armbian
   KERNEL_GIT: shallow
+  TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
 
 jobs:
   build:
@@ -26,9 +34,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Check the tag against the kernel pin
-        if: github.ref_type == 'tag'
-        env:
-          TAG: ${{ github.ref_name }}
+        if: env.TAG != ''
         run: |
           kernel=$(sed -n 's/^declare -g KERNELBRANCH=tag:v//p' userpatches/config-opi5.conf)
           if [[ -z $kernel || $TAG != "v$kernel-"* || ! ${TAG#"v$kernel-"} =~ ^[1-9][0-9]*$ ]]; then
@@ -73,7 +79,7 @@ jobs:
 
       - name: Add the userpatches tarball
         env:
-          NAME: opi5-userpatches-${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+          NAME: opi5-userpatches-${{ env.TAG || github.sha }}
         run: |
           tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@"$(git log -1 --format=%ct)" \
             -czf "out/$NAME.tar.gz" userpatches
@@ -88,24 +94,36 @@ jobs:
 
   release:
     needs: build
-    if: github.ref_type == 'tag'
+    if: inputs.tag || github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
+      # The history and tags, for the release notes.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
+
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: opi5-kernel
           path: out
 
+      # Without a pushed tag, the release creates it at this commit. A tag created with
+      # GITHUB_TOKEN starts no workflow, so this doesn't build twice.
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cd out
-          sha256sum --check SHA256SUMS
-          gh release create "$GITHUB_REF_NAME" \
+          (cd out && sha256sum --check SHA256SUMS)
+          tools/release-notes.sh "$TAG" > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "$GITHUB_REF_NAME" \
-            --notes "Armbian current kernel for the Orange Pi 5 Pro with the MPP/RGA and RKNPU drivers. Install the three .deb files, or extract opi5-userpatches-*.tar.gz into an armbian/build checkout and run ./compile.sh opi5 kernel." \
-            linux-*.deb opi5-userpatches-*.tar.gz SHA256SUMS
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            out/linux-*.deb out/opi5-userpatches-*.tar.gz out/SHA256SUMS
