@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Every third day too: it catches upstream breakage, and it uses the caches, which GitHub
+  # evicts after 7 days unused.
+  schedule:
+    - cron: "17 5 */3 * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -11,10 +16,24 @@ permissions:
 env:
   MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
   KERNEL_GIT: shallow
+  # A host path, not a volume, so actions/cache can keep Armbian's caches.
+  OPI5_ARMBIAN_VOLUME: ${{ github.workspace }}/work/armbian
 
 jobs:
   check:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: write # Deletes superseded caches.
+    env:
+      # The kernel git with patch.sh's patched result and key: with the same patches and
+      # Armbian, patch.sh skips Armbian's patching (11 minutes). Worktrees aren't kept;
+      # Armbian recreates them. Plus ccache for the drivers.
+      CACHE_PATHS: |
+        work/armbian/cache/git-bare
+        !work/armbian/cache/git-bare/*/.git/worktrees
+        work/armbian/cache/opi5-patch.key
+        work/armbian/cache/ccache
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -23,6 +42,20 @@ jobs:
       - name: Lint
         run: mise run lint
 
+      # From main's caches, which pull requests can read too.
+      - name: Restore caches
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CACHE_PATHS }}
+          key: check-${{ hashFiles('build.sh', 'userpatches/**') }}
+          restore-keys: check-
+
+      - name: Limit ccache
+        run: |
+          mkdir -p work/armbian/cache/ccache
+          echo "max_size = 1G" > work/armbian/cache/ccache/ccache.conf
+
       - name: Apply the patches and compile the drivers
         run: mise run check
 
@@ -30,3 +63,33 @@ jobs:
       - name: Bump report
         if: ${{ !cancelled() && startsWith(github.head_ref, 'renovate/') }}
         run: mise run bump-report >> "$GITHUB_STEP_SUMMARY"
+
+      # Only main saves: a pull request's caches are its own, and would only crowd out
+      # main's under the repository's limit. Written as root in the container.
+      - name: Own the caches
+        if: success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true'
+        run: sudo chown -R "$(id -u):$(id -g)" work/armbian/cache
+
+      - if: success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CACHE_PATHS }}
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+      - name: Delete superseded caches
+        if: success() && github.ref == 'refs/heads/main' && steps.cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEY: ${{ steps.cache.outputs.cache-primary-key }}
+        run: tools/cache-prune.sh check- "$KEY"
+
+  # Restores build.yml's ccache, so it isn't evicted between weekly builds.
+  keep-ccache:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: work/armbian/cache/ccache
+          key: ccache-
+          restore-keys: ccache-

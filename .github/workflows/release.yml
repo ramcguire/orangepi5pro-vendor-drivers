@@ -47,3 +47,4 @@ jobs:
       tag: ${{ needs.plan.outputs.tag }}
     permissions:
       contents: write
+      actions: write # build.yml deletes superseded caches.
