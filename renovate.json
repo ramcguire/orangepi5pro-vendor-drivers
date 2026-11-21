@@ -2,6 +2,9 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended", "helpers:pinGitHubActionDigests"],
   "semanticCommits": "enabled",
+  "description": "Each pull request runs check.yml, and each merge that changes the packages runs a build of up to 6 hours, so updates come in two grouped pull requests (packageRules), majors included, rebased only on conflicts rather than on every push to main.",
+  "rebaseWhen": "conflicted",
+  "separateMajorMinor": false,
   "customManagers": [
     {
       "description": "A `# renovate:` line, then NAME=value (or declare -g NAME=tag:value), then an optional NAME_COMMIT=<sha> digest line",
@@ -34,6 +37,11 @@
   ],
   "packageRules": [
     {
+      "description": "Everything that doesn't change the packages (GitHub Actions, mise's tools, hk's Pkl package, Renovate's image): one pull request. Merging it doesn't release. Listed first, so the group below takes its dependencies out.",
+      "matchPackageNames": ["*"],
+      "groupName": "tooling"
+    },
+    {
       "description": "Armbian's tags: vX.Y.0-trunk.N builds lead up to the vX.Y.1 release. Older unprefixed tags don't match and are ignored.",
       "matchDepNames": ["armbian/build"],
       "versioning": "regex:^v(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)(?:-trunk\\.(?<build>\\d+))?$"
@@ -44,20 +52,10 @@
       "versioning": "regex:^v(?<major>6)\\.(?<minor>18)\\.(?<patch>\\d+)$"
     },
     {
-      "description": "One pull request moves the pair, so check.yml tests Armbian's patches and ours on the new kernel together. If the kernel is ahead of Armbian's patches, the check fails and the pull request waits for Armbian's next tag. Opened on Tuesdays, after Armbian's Monday tag, for one release a week (release.yml).",
-      "matchDepNames": ["armbian/build", "linux"],
+      "description": "Everything the packages are built from, in one pull request, so the merge releases once (release.yml): Armbian's tag, the 6.18.y kernel tag, and the builder image, whose -latest digest moves most days. check.yml tests Armbian's patches and ours on the new kernel together. If the kernel is ahead of Armbian's patches, the check fails and the pull request waits for Armbian's next tag. Opened on Tuesdays, after Armbian's Monday tag, for at most one release a week.",
+      "matchDepNames": ["armbian/build", "linux", "ghcr.io/armbian/docker-armbian-build"],
       "groupName": "Armbian and kernel",
       "schedule": ["* * * * 2"]
-    },
-    {
-      "description": "Renovate releases several times a day; its image only runs renovate-check.",
-      "matchDepNames": ["ghcr.io/renovatebot/renovate"],
-      "schedule": ["* 0-5 1 * *"]
-    },
-    {
-      "description": "hk's binary (mise.toml) and its Pkl package (hk.pkl) move together.",
-      "matchDepNames": ["hk", "jdx/hk"],
-      "groupName": "hk"
     }
   ]
 }
