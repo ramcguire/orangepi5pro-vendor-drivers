@@ -2,7 +2,7 @@
 # Armbian sources this file; opts_* and kernel_work_dir are its own.
 # shellcheck disable=SC2034,SC2154
 #
-# Kconfig for the zz-opi5-* patches. Their symbols lack useful defaults, so all are set
+# Kconfig for the zz-opi5-* kernel patches. Their symbols lack useful defaults, so all are set
 # here, and the build fails if one isn't in the final .config (an unmet dependency drops
 # it silently).
 
@@ -85,4 +85,17 @@ function pre_package_kernel_image__opi5_check_config() {
 		exit_with_error "opi5: kernel options not in the final .config (unmet dependency?)" "${missing[*]}"
 	fi
 	display_alert "opi5" "all ${#OPI5_KERNEL_CONFIG[@]} kernel options in the final .config" "info"
+}
+
+# U-Boot: the zz-opi5-* patches in u-boot/<Armbian's BOOTPATCHDIR>/board_orangepi5pro/
+# power the PCIe slot off before Linux, without which the YT6801 Ethernet fails to train on
+# about half of the boots. Armbian only applies them while its BOOTPATCHDIR matches ours, so
+# fail if a bump moved U-Boot on and left them behind. Runs in the patched source.
+function pre_config_uboot_target__opi5_check_patches() {
+	[[ "${BOARD}" == orangepi5pro && "${BRANCH}" != vendor* ]] || return 0
+	grep -q '^static int rockchip_pcie_remove(' drivers/pci/pcie_dw_rockchip.c &&
+		[[ -f arch/arm/dts/rk3588s-orangepi-5-pro-u-boot.dtsi ]] ||
+		exit_with_error "opi5: U-Boot ${BOOTBRANCH} lacks our patches" \
+			"move userpatches/u-boot/ to Armbian's BOOTPATCHDIR (${BOOTPATCHDIR})"
+	display_alert "opi5" "U-Boot PCIe power-off patches applied" "info"
 }

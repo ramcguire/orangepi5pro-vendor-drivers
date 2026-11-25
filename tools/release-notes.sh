@@ -24,7 +24,9 @@ apt-mark hold linux-image-current-rockchip64 linux-dtb-current-rockchip64 linux-
 reboot
 \`\`\`
 
-To build it yourself, extract \`opi5-userpatches-$tag.tar.gz\` into armbian/build at $armbian and run \`./compile.sh opi5 kernel\`.
+\`linux-u-boot-orangepi5pro-current\` is Armbian's U-Boot with the fix for the Ethernet missing on about half of the boots. It doesn't depend on the kernel, and installing it doesn't write it to the boot device. See the README's U-Boot section.
+
+To build it yourself, extract \`opi5-userpatches-$tag.tar.gz\` into armbian/build at $armbian and run \`./compile.sh opi5 kernel\` and \`./compile.sh opi5 uboot\`.
 
 EOF
 range=()

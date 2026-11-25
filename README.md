@@ -8,6 +8,8 @@ Armbian's "current" kernel (6.18) for the **Orange Pi 5 Pro** (RK3588S), with Ro
 
 It's an Armbian [`userpatches/`](userpatches/) directory: patches, device tree, one extension, one build config.
 
+It also has a fix for Armbian's U-Boot on this board, which leaves the PCIe slot powered and its link up when Linux starts: the YT6801 Ethernet then fails on about half of the boots. See [U-Boot](#u-boot).
+
 ## Use
 
 **Packages.** Each [release](../../releases) has the `linux-image`, `linux-dtb` and `linux-headers` packages. On an Armbian `current` install for the Orange Pi 5 Pro:
@@ -21,9 +23,22 @@ reboot
 
 The packages carry the names of Armbian's kernel, so hold them, or Armbian's repository replaces them.
 
+**U-Boot.** Each release also has `linux-u-boot-orangepi5pro-current`, Armbian's U-Boot with the fix. It doesn't depend on the kernel. Installing the package doesn't change what boots: write it to the card or eMMC Armbian boots from, after saving that boot area:
+
+```sh
+apt install ./linux-u-boot-orangepi5pro-current_*.deb
+apt-mark hold linux-u-boot-orangepi5pro-current
+dev=/dev/$(lsblk -ndo pkname "$(findmnt -no SOURCE /)")
+dd if="$dev" of=/root/bootarea.img bs=512 count=32768
+. /usr/lib/u-boot/platform_install.sh && write_uboot_platform "$DIR" "$dev"
+reboot
+```
+
+To undo it, write the saved one back with `dd if=/root/bootarea.img of="$dev" bs=32k skip=1 seek=1 count=511 conv=notrunc`. For U-Boot in SPI flash, use `armbian-install` instead.
+
 **Userspace.** For the codecs and RGA, use FFmpeg built with rkmpp and librga. NPU clients need `/dev/rknpu`, `/dev/dma_heap` and `librknnrt` 2.3.2; 2.3.0 times out every job on this driver.
 
-**Build with Armbian.** Copy `userpatches/` (or a release's `opi5-userpatches-*.tar.gz`) into [armbian/build](https://github.com/armbian/build) at the tag `build.sh` pins, then run `./compile.sh opi5 kernel`. To add the drivers to another build, copy `kernel/archive/rockchip64-6.18/` and `extensions/opi5.sh` and set `ENABLE_EXTENSIONS=opi5`.
+**Build with Armbian.** Copy `userpatches/` (or a release's `opi5-userpatches-*.tar.gz`) into [armbian/build](https://github.com/armbian/build) at the tag `build.sh` pins, then run `./compile.sh opi5 kernel` (and `./compile.sh opi5 uboot`). To add the drivers to another build, copy `kernel/archive/rockchip64-6.18/` and `extensions/opi5.sh` and set `ENABLE_EXTENSIONS=opi5`.
 
 **Build here.** With Docker and [mise](https://mise.jdx.dev), on any OS, `mise run build` runs `build.sh` in Armbian's builder image. The packages and logs go to `out/`, and caches go to the `opi5-armbian` volume. Arguments after `--` go to `compile.sh`. The other tasks (`mise tasks`):
 
@@ -78,6 +93,17 @@ The thousands digit is the purpose.
 - `-npu.dtsi`: mack42's vendor NPU node in place of mainline's rocket nodes, with one IOMMU domain for all three cores.
 
 **Kernel config.** `extensions/opi5.sh` builds the drivers and tests as modules. It turns off the V4L2 decoder and rocket (they bind the same hardware), and turns on the lockup and hung-task detectors, warn-only. The build fails if an option is missing from the final `.config`.
+
+## U-Boot
+
+Armbian's U-Boot 2025.10 for this board turns on `CONFIG_PCI_INIT_R`, so it trains the PCIe link to the YT6801 and probes it on every boot. Its PCIe driver then leaves the link up, PERST# released and the slot powered for Linux. On about half of the boots, the YT6801 then doesn't train under Linux and Ethernet is missing. Switching the slot off before Linux fixes it; holding it in reset alone doesn't. The patches, in `userpatches/u-boot/v2025.10/board_orangepi5pro/`:
+
+| Patch | What it does |
+| --- | --- |
+| `0010` | `pcie_dw_rockchip`: a remove hook, run just before the OS (`DM_FLAG_OS_PREPARE`), that asserts PERST#, stops the link and switches the slot supply off. For upstream U-Boot |
+| `0020` | The board's U-Boot DT: `vcc3v3_phy1` is no longer `regulator-always-on` or `regulator-boot-on`, which kept it on. The PCIe driver switches it on itself, and Linux's DT is unchanged |
+
+With them, Ethernet came up on 14 of 14 boots, against 15 of 32 without. Armbian applies them only while its `BOOTPATCHDIR` for the board is `v2025.10`: `check` fails if a bump moves it, and the build fails if they weren't applied (`extensions/opi5.sh`).
 
 ## Hardening
 

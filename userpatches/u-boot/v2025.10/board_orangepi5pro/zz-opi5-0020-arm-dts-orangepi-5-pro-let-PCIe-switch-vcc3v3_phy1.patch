@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: opi5 <noreply@example.invalid>
+Date: Tue, 24 Nov 2026 00:00:00 +0000
+Subject: [PATCH] arm: dts: rk3588s-orangepi-5-pro: let PCIe switch
+ vcc3v3_phy1
+
+The YT6801's supply is regulator-always-on and regulator-boot-on, so
+pcie_dw_rockchip's remove hook can't switch it off before the OS:
+regulator_set_enable() refuses for always-on, and with boot-on the
+regulator is enabled twice (autoset, then the PCIe driver), so one
+disable leaves it on.
+
+Drop both in U-Boot's DT. The PCIe driver switches the supply on
+itself before training the link, and Linux's DT is unchanged.
+rk3588-u-boot.dtsi is what the build included before, by SoC.
+---
+ arch/arm/dts/rk3588s-orangepi-5-pro-u-boot.dtsi | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+ create mode 100644 arch/arm/dts/rk3588s-orangepi-5-pro-u-boot.dtsi
+
+diff --git a/arch/arm/dts/rk3588s-orangepi-5-pro-u-boot.dtsi b/arch/arm/dts/rk3588s-orangepi-5-pro-u-boot.dtsi
+new file mode 100644
+index 0000000..7e298b7
+--- /dev/null
++++ b/arch/arm/dts/rk3588s-orangepi-5-pro-u-boot.dtsi
+@@ -0,0 +1,14 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++
++#include "rk3588-u-boot.dtsi"
++
++/*
++ * Let the PCIe driver own the YT6801's supply: it switches it on in
++ * rockchip_pcie_init_port() and off again before the OS starts. With
++ * regulator-always-on U-Boot can't switch it off, and with regulator-boot-on
++ * the extra enable keeps it on (enable_count 2).
++ */
++&vcc3v3_phy1 {
++	/delete-property/ regulator-always-on;
++	/delete-property/ regulator-boot-on;
++};
