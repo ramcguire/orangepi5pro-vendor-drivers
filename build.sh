@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the opi5 kernel packages with Armbian into $OUT_DIR (default out/).
+# Build the opi5 kernel and U-Boot packages with Armbian into $OUT_DIR (default out/).
 #
 #   ./build.sh [compile.sh parameters]
 #
@@ -16,9 +16,15 @@ ARMBIAN_COMMIT=910bf7b2ea91c86b95b8673fc655d22d285d446c
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 armbian=${ARMBIAN_DIR:-$here/work/armbian}
 out=${OUT_DIR:-$here/out}
-packages=(linux-image linux-dtb linux-headers)
+board=$(sed -n "s/^declare -g BOARD=//p" "$here/userpatches/config-opi5.conf")
+packages=(
+	linux-image-current-rockchip64
+	linux-dtb-current-rockchip64
+	linux-headers-current-rockchip64
+	"linux-u-boot-${board:?no BOARD in config-opi5.conf}-current"
+)
 
-# Logs to out/, where they outlive the container: ours, and Armbian's log and summary.
+# Logs to out/, where they outlive the container: ours, and Armbian's logs and summaries.
 mkdir -p "$out"
 rm -f "$out/build.log" "$out/build-armbian.log" "$out/build-summary.md"
 exec > >(tee "$out/build.log") 2>&1
@@ -29,8 +35,8 @@ finish() {
 	for f in "$armbian"/output/logs/*; do
 		[[ -f $f && $f -nt $stamp ]] || continue
 		case $f in
-		*/log-*.log) cp "$f" "$out/build-armbian.log" ;;
-		*/summary-*.md) cp "$f" "$out/build-summary.md" ;;
+		*/log-*.log) cat "$f" >> "$out/build-armbian.log" ;;
+		*/summary-*.md) cat "$f" >> "$out/build-summary.md" ;;
 		esac
 	done
 	rm -f "$stamp"
@@ -52,15 +58,16 @@ cp -R "$here/userpatches" "$armbian/userpatches"
 
 debs=$armbian/output/debs
 for package in "${packages[@]}"; do
-	rm -f "$debs/$package"-current-rockchip64_*.deb
+	rm -f "$debs/$package"_*.deb
 done
 
 (cd "$armbian" && ./compile.sh opi5 kernel "$@")
+(cd "$armbian" && ./compile.sh opi5 uboot "$@")
 
 mkdir -p "$out"
 rm -f "$out"/linux-*.deb "$out/SHA256SUMS"
 for package in "${packages[@]}"; do
-	found=("$debs/$package"-current-rockchip64_*.deb)
+	found=("$debs/$package"_*.deb)
 	[[ ${#found[@]} -eq 1 && -f ${found[0]} ]] || {
 		echo "build.sh: expected one $package package in $debs, found ${#found[@]}" >&2
 		exit 1

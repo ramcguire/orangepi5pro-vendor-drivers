@@ -3,8 +3,9 @@
 #
 #   tools/patch.sh [dir] [compile.sh parameters]
 #
-# Fails if our board .dts isn't Armbian's above our includes, if a patch doesn't apply, or
-# if one of ours needs an offset or fuzz. Each patch becomes a commit; the result is kept
+# Fails if our board .dts isn't Armbian's above our includes, if our U-Boot patches aren't in
+# Armbian's U-Boot patch dir, if a patch doesn't apply, or if one of ours needs an offset or
+# fuzz. Each kernel patch becomes a commit; the result is kept
 # as refs/opi5/patched in Armbian's kernel git (tools/kernel-git.sh; a build resets its branch)
 # and reused while Armbian's patch hashes stay the same. Delete cache/opi5-patch.key to
 # force a run.
@@ -78,8 +79,25 @@ check_dt() {
 	return "$status"
 }
 
+# Armbian takes our U-Boot patches only from its own BOOTPATCHDIR, so a bump that moves
+# U-Boot on must move them (the build fails too: extensions/opi5.sh). Not applied here.
+check_uboot() {
+	local ours board theirs status=0
+	for ours in "$here"/userpatches/u-boot/*/board_*; do
+		[[ -d $ours ]] || continue
+		board=${ours##*/board_}
+		theirs=$(sed -n 's/^\s*declare -g BOOTPATCHDIR="\(.*\)"$/\1/p' "$armbian/config/boards/$board.csc")
+		if [[ ${ours#"$here"/userpatches/u-boot/} != "$theirs/board_$board" ]]; then
+			echo "::error::${ours#"$here"/} isn't Armbian's U-Boot patch dir for $board (u-boot/${theirs:-?}/board_$board)"
+			status=1
+		fi
+	done
+	return "$status"
+}
+
 bash "$here/tools/armbian.sh" "$armbian"
 check_dt
+check_uboot
 rm -rf "$armbian/userpatches"
 cp -R "$here/userpatches" "$armbian/userpatches"
 

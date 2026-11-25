@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: opi5 <noreply@example.invalid>
+Date: Tue, 24 Nov 2026 00:00:00 +0000
+Subject: [PATCH] pci: pcie_dw_rockchip: put the port in reset before the
+ OS
+
+The driver trains the link at probe (with CONFIG_PCI_INIT_R, on every
+boot) and leaves it that way: the LTSSM running, PERST# released and
+the slot powered. The OS then starts with the endpoint live in L0.
+
+The Orange Pi 5 Pro's Motorcomm YT6801 fails to train again under Linux
+on about half of such boots (LTSSM stuck in Polling.Compliance) until
+its supply is switched off and on. Holding it in reset alone doesn't
+help; removing the slot power before the OS does: 14 of 14 boots
+trained, against about half without.
+
+Add a remove hook with DM_FLAG_OS_PREPARE, like other PCIe host
+drivers have, that asserts PERST#, stops the LTSSM and switches
+vpcie3v3 off. A port whose link failed isn't probed, and its supply is
+already off.
+---
+ drivers/pci/pcie_dw_rockchip.c | 32 ++++++++++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/drivers/pci/pcie_dw_rockchip.c b/drivers/pci/pcie_dw_rockchip.c
+index 208aa30..d764762 100644
+--- a/drivers/pci/pcie_dw_rockchip.c
++++ b/drivers/pci/pcie_dw_rockchip.c
+@@ -486,6 +486,36 @@ rockchip_pcie_probe_err_init_port:
+ 	return ret;
+ }
+ 
++/**
++ * rockchip_pcie_remove() - Put the slot back in reset before the OS starts
++ *
++ * @dev: A pointer to the device being operated on
++ *
++ * The OS expects to find the endpoint powered off or held in reset, and does
++ * its own power-up and link training. An endpoint left in L0 with PERST#
++ * released can fail to train again after the OS resets the controller (seen
++ * with the Motorcomm YT6801 on the Orange Pi 5 Pro), so assert PERST#, stop
++ * the LTSSM and remove the slot power.
++ *
++ * Return: 0
++ */
++static int rockchip_pcie_remove(struct udevice *dev)
++{
++	struct rk_pcie *priv = dev_get_priv(dev);
++	int ret;
++
++	if (dm_gpio_is_valid(&priv->rst_gpio))
++		dm_gpio_set_value(&priv->rst_gpio, 0);
++
++	rk_pcie_disable_ltssm(priv);
++
++	ret = regulator_set_enable_if_allowed(priv->vpcie3v3, false);
++	if (ret)
++		dev_warn(dev, "failed to disable vpcie3v3 (ret=%d)\n", ret);
++
++	return 0;
++}
++
+ static const struct dm_pci_ops rockchip_pcie_ops = {
+ 	.read_config	= pcie_dw_read_config,
+ 	.write_config	= pcie_dw_write_config,
+@@ -503,5 +533,7 @@ U_BOOT_DRIVER(rockchip_dw_pcie) = {
+ 	.of_match		= rockchip_pcie_ids,
+ 	.ops			= &rockchip_pcie_ops,
+ 	.probe			= rockchip_pcie_probe,
++	.remove			= rockchip_pcie_remove,
+ 	.priv_auto		= sizeof(struct rk_pcie),
++	.flags			= DM_FLAG_OS_PREPARE,
+ };
