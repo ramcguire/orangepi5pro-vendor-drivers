@@ -59,7 +59,7 @@ index 3daf18d1399d..a900466b899c 100644
  obj-$(CONFIG_ROCKCHIP_MPP_SERVICE) += rk_vcodec.o
 +obj-$(CONFIG_ROCKCHIP_MPP_KUNIT_TEST) += mpp_kunit.o
 diff --git a/drivers/media/platform/rockchip/mpp/mpp_common.c b/drivers/media/platform/rockchip/mpp/mpp_common.c
-index 0161ddd21be3..9b09ae9a4f80 100644
+index e2c0da6e5de1..16f17701a0fa 100644
 --- a/drivers/media/platform/rockchip/mpp/mpp_common.c
 +++ b/drivers/media/platform/rockchip/mpp/mpp_common.c
 @@ -30,6 +30,7 @@
@@ -96,7 +96,7 @@ index 0161ddd21be3..9b09ae9a4f80 100644
  int mpp_extract_reg_offset_info(struct reg_offset_info *off_inf,
  				struct mpp_request *req)
 diff --git a/drivers/media/platform/rockchip/mpp/mpp_common.h b/drivers/media/platform/rockchip/mpp/mpp_common.h
-index c8202f56cada..70e855b7f548 100644
+index 1be32bf6e6e5..06008728a99a 100644
 --- a/drivers/media/platform/rockchip/mpp/mpp_common.h
 +++ b/drivers/media/platform/rockchip/mpp/mpp_common.h
 @@ -635,6 +635,10 @@ int mpp_translate_reg_address(struct mpp_session *session,

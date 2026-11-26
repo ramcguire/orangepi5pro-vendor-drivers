@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: opi5 <noreply@example.invalid>
+Date: Tue, 24 Nov 2026 00:00:00 +0000
+Subject: [PATCH] media: rockchip: mpp: defer cores until their CCU and core 0
+ are bound
+
+As modules, the codec cores can probe before their CCU or core 0: the
+attach then fails and leaves the core queued, or reads core 0 while it
+is NULL. Defer probe until both are bound.
+---
+ .../media/platform/rockchip/mpp/mpp_common.c  | 37 +++++++++++++++++++
+ .../media/platform/rockchip/mpp/mpp_common.h  |  1 +
+ .../media/platform/rockchip/mpp/mpp_rkvdec2.c |  4 ++
+ .../media/platform/rockchip/mpp/mpp_rkvenc2.c |  4 ++
+ 4 files changed, 46 insertions(+)
+
+diff --git a/drivers/media/platform/rockchip/mpp/mpp_common.c b/drivers/media/platform/rockchip/mpp/mpp_common.c
+index 18c4343573a1..cb46added228 100644
+--- a/drivers/media/platform/rockchip/mpp/mpp_common.c
++++ b/drivers/media/platform/rockchip/mpp/mpp_common.c
+@@ -2273,6 +2273,43 @@ int mpp_dev_probe(struct mpp_dev *mpp,
+ 	return ret;
+ }
+ 
++/* 0 if @np is unset, disabled or bound; puts @np. */
++static int mpp_wait_bound(struct device *dev, struct device_node *np)
++{
++	struct platform_device *pdev;
++	int ret = 0;
++
++	if (!np)
++		return 0;
++	if (of_device_is_available(np)) {
++		pdev = of_find_device_by_node(np);
++		if (!pdev || !device_is_bound(&pdev->dev))
++			ret = dev_err_probe(dev, -EPROBE_DEFER, "waiting for %pOF\n", np);
++		if (pdev)
++			put_device(&pdev->dev);
++	}
++	of_node_put(np);
++
++	return ret;
++}
++
++/*
++ * As modules, cores can probe before their CCU or core 0: the attach then
++ * fails, or reads core 0 while it is NULL. Defer until both are bound.
++ */
++int mpp_ccu_ready(struct device *dev, const char *stem)
++{
++	char alias[16];
++	int ret;
++
++	ret = mpp_wait_bound(dev, of_parse_phandle(dev->of_node, "rockchip,ccu", 0));
++	if (ret || of_alias_get_id(dev->of_node, stem) <= 0)
++		return ret;
++
++	snprintf(alias, sizeof(alias), "%s0", stem);
++	return mpp_wait_bound(dev, of_find_node_by_path(alias));
++}
++
+ int mpp_dev_remove(struct mpp_dev *mpp)
+ {
+ 	if (mpp->hw_ops->exit)
+diff --git a/drivers/media/platform/rockchip/mpp/mpp_common.h b/drivers/media/platform/rockchip/mpp/mpp_common.h
+index 1fd707b48849..3989b5e7082b 100644
+--- a/drivers/media/platform/rockchip/mpp/mpp_common.h
++++ b/drivers/media/platform/rockchip/mpp/mpp_common.h
+@@ -670,6 +670,7 @@ int mpp_taskqueue_pending_to_run(struct mpp_taskqueue *queue, struct mpp_task *t
+ int mpp_dev_probe(struct mpp_dev *mpp,
+ 		  struct platform_device *pdev);
+ int mpp_dev_remove(struct mpp_dev *mpp);
++int mpp_ccu_ready(struct device *dev, const char *stem);
+ void mpp_dev_shutdown(struct platform_device *pdev);
+ int mpp_dev_register_srv(struct mpp_dev *mpp, struct mpp_service *srv);
+ 
+diff --git a/drivers/media/platform/rockchip/mpp/mpp_rkvdec2.c b/drivers/media/platform/rockchip/mpp/mpp_rkvdec2.c
+index 9a1a973d60f9..5f32fbd9a10f 100644
+--- a/drivers/media/platform/rockchip/mpp/mpp_rkvdec2.c
++++ b/drivers/media/platform/rockchip/mpp/mpp_rkvdec2.c
+@@ -1935,6 +1935,10 @@ static int rkvdec2_core_probe(struct platform_device *pdev)
+ 	struct device *dev = &pdev->dev;
+ 	irq_handler_t irq_proc = NULL;
+ 
++	ret = mpp_ccu_ready(dev, "rkvdec");
++	if (ret)
++		return ret;
++
+ 	dec = devm_kzalloc(dev, sizeof(*dec), GFP_KERNEL);
+ 	if (!dec)
+ 		return -ENOMEM;
+diff --git a/drivers/media/platform/rockchip/mpp/mpp_rkvenc2.c b/drivers/media/platform/rockchip/mpp/mpp_rkvenc2.c
+index eb4ac8c0aba6..9bc7596192b0 100644
+--- a/drivers/media/platform/rockchip/mpp/mpp_rkvenc2.c
++++ b/drivers/media/platform/rockchip/mpp/mpp_rkvenc2.c
+@@ -3074,6 +3074,10 @@ static int rkvenc_core_probe(struct platform_device *pdev)
+ 	struct rkvenc_dev *enc = NULL;
+ 	struct mpp_dev *mpp = NULL;
+ 
++	ret = mpp_ccu_ready(dev, "rkvenc");
++	if (ret)
++		return ret;
++
+ 	enc = devm_kzalloc(dev, sizeof(*enc), GFP_KERNEL);
+ 	if (!enc)
+ 		return -ENOMEM;
