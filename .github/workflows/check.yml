@@ -118,6 +118,34 @@ jobs:
           name: dkms-check-${{ matrix.branch }}
           path: out/dkms-check/*/
 
+  # A scheduled failure opens one issue (or comments on it); the next pass closes it.
+  report:
+    needs: [check, dkms]
+    if: always() && github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      FAILED: ${{ contains(needs.*.result, 'failure') }}
+      RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      TITLE: Scheduled check failed
+    steps:
+      - run: |
+          issue=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number,title \
+            --jq ".[] | select(.title == env.TITLE) | .number" | head -1)
+          if [[ $FAILED == true ]]; then
+            body="$RUN failed against Armbian's newest packages. Hold the kernel (\`apt-mark hold linux-image-current-rockchip64 linux-dtb-current-rockchip64 linux-headers-current-rockchip64\`) until it passes."
+            if [[ -n $issue ]]; then
+              gh issue comment "$issue" --body "$RUN failed again."
+            else
+              gh issue create --title "$TITLE" --body "$body"
+            fi
+          elif [[ -n $issue ]]; then
+            gh issue close "$issue" --comment "$RUN passed."
+          fi
+
   # Restores build.yml's ccache, so it isn't evicted between weekly builds.
   keep-ccache:
     if: github.event_name == 'schedule'
