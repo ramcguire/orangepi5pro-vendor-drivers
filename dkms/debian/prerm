@@ -1,0 +1,23 @@
+#!/bin/sh
+set -e
+env=/boot/armbianEnv.txt
+packages="@PACKAGES@"
+overlays="@OVERLAYS@"
+
+case "$1" in
+	remove | upgrade | deconfigure)
+		for pkg in $packages; do
+			dkms remove -m "$pkg" -v @VERSION@ --all || true
+		done
+		;;
+esac
+if [ "$1" = remove ] && [ -f $env ]; then
+	keep=
+	line=$(sed -n "s/^user_overlays=//p" $env)
+	for x in $line; do
+		case " $overlays " in *" $x "*) ;; *) keep="$keep $x" ;; esac
+	done
+	sed -i '/^user_overlays=/d' $env
+	[ -z "$keep" ] || [ -z "$(tail -c1 $env)" ] || echo >> $env
+	[ -z "$keep" ] || echo "user_overlays=${keep# }" >> $env
+fi

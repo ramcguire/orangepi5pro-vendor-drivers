@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: GPL-2.0
+# Kconfig values for the out-of-tree build.
+CONFIG_ROCKCHIP_RKNPU := m
+
+include $(src)/Makefile

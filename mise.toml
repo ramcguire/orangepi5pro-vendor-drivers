@@ -54,23 +54,24 @@ run = "{{vars.docker}} {{vars.builder}} ./build.sh ENABLE_EXTENSIONS=ccache"
 description = "Build only rk_vcodec.ko, rga3.ko, rknpu.ko, their KUnit tests and the board DTB into out/drivers/"
 run = "{{vars.docker}} {{vars.builder}} tools/modules.sh /work/kernel /work/build"
 
-[tasks.dkms-src]
-description = "DKMS sources of the three drivers into out/dkms/"
-run = "{{vars.docker}} --env \"GIT_DESCRIBE={{exec(command='git describe --tags --match v* --dirty')}}\" {{vars.builder}} tools/dkms-src.sh /work/kernel"
+[tasks.deb]
+description = "The drivers-only package (make deb) into out/"
+run = "{{vars.docker}} --env GIT_DESCRIBE {{vars.builder}} -c \"make deb && chown -R --reference=. out/dtbo out/*.deb\""
 
 [tasks.overlays]
-description = "Overlays into out/overlays/, checked against our DTB; arguments are stock DTBs to apply them to"
+description = "Overlays into overlays/ (committed) and out/overlays/, checked against our DTB; arguments are stock DTBs to apply them to"
 run = "{{vars.docker}} {{vars.builder}} tools/overlays.sh /work/kernel"
 
 [tasks.dkms-check]
-description = "Build the DKMS sources against Armbian's headers packages; arguments are package[=version]"
+description = "Install the drivers-only package against Armbian's headers and DTB packages; arguments are package[=version]"
 run = "docker run --rm --platform linux/arm64 --entrypoint bash --workdir /src --mount \"type=bind,source={{config_root}},target=/src\" --env OUT_DIR=/src/out {{vars.debian}} tools/dkms-check.sh"
 
 [tasks.check]
-description = "Apply all patches with Armbian's patcher (tools/patch.sh), then compile the drivers and DTB from that tree"
+description = "Apply all patches with Armbian's patcher (tools/patch.sh), compile the drivers and DTB from that tree, and check the DKMS sources and overlays/ against it"
 run = [
   "{{vars.docker}} {{vars.builder}} tools/patch.sh /work/check",
   "{{vars.docker}} --env OUT_DIR=/work/check-out {{vars.builder}} tools/modules.sh /work/check /work/check-build",
+  "{{vars.docker}} {{vars.builder}} -c \"tools/dkms-src.sh /src/out/src --against /work/check && tools/overlays.sh /work/check\"",
 ]
 
 [tasks.bump-report]
