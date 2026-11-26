@@ -1,2 +1,4 @@
 * text=auto eol=lf
 *.patch -text
+# Generated from dt/ (tools/overlays.sh).
+overlays/** linguist-generated

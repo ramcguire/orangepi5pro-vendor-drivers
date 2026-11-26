@@ -14,7 +14,7 @@ indent_size = 2
 indent_style = tab
 
 # Kernel style, as the drivers they test.
-[*.c]
+[*.{c,h}]
 indent_style = tab
 
 [Makefile]
@@ -31,4 +31,11 @@ insert_final_newline = false
 
 # Markdown indents follow list nesting, not a fixed width.
 [*.md]
+indent_size = unset
+
+# Maintainer scripts are shell; control continues lines with one space.
+[dkms/debian/{postinst,prerm}]
+indent_style = tab
+
+[dkms/debian/control]
 indent_size = unset

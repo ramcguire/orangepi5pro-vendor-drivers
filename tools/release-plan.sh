@@ -5,8 +5,8 @@
 #   tools/release-plan.sh
 #
 # A release is due when what the packages are built from changed since the last release:
-# userpatches/, build.sh (Armbian's pin) or mise.toml's builder image (the compiler). The
-# tag is v<kernel>-<n>, n counting from 1 for each kernel.
+# userpatches/, build.sh (Armbian's pin), the DKMS package's own files and scripts or mise.toml's
+# builder image (the compiler). The tag is v<kernel>-<n>, n counting from 1 for each kernel.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -17,8 +17,8 @@ kernel=$(sed -n 's/^declare -g KERNELBRANCH=tag:v//p' userpatches/config-opi5.co
 last=$(git describe --tags --abbrev=0 --match 'v[0-9]*-[0-9]*' HEAD 2> /dev/null || true)
 if [[ -z $last ]]; then
 	why="no release yet"
-elif ! git diff --quiet "$last" HEAD -- userpatches build.sh; then
-	why="userpatches/ or build.sh changed since $last"
+elif ! git diff --quiet "$last" HEAD -- userpatches build.sh Makefile dkms udev overlays tools/dkms-src.sh tools/version.sh; then
+	why="userpatches/, build.sh or the DKMS package changed since $last"
 elif git diff "$last" HEAD -- mise.toml | grep -q '^[-+]builder = '; then
 	why="the builder image changed since $last"
 else

@@ -1,0 +1,29 @@
+#!/bin/sh
+# DKMS builds the drivers now, and for later kernels as their headers install. The overlays
+# go in Armbian's user_overlays.
+set -e
+env=/boot/armbianEnv.txt
+packages="@PACKAGES@"
+overlays="@OVERLAYS@"
+
+if [ "$1" = configure ]; then
+	for pkg in $packages; do
+		/usr/lib/dkms/common.postinst "$pkg" @VERSION@ "" "" "$2"
+	done
+	if [ -f $env ]; then
+		keep=
+		line=$(sed -n "s/^user_overlays=//p" $env)
+		for x in $line; do
+			case " $overlays " in *" $x "*) ;; *) keep="$keep $x" ;; esac
+		done
+		sed -i '/^user_overlays=/d' $env
+		[ -z "$(tail -c1 $env)" ] || echo >> $env
+		echo "user_overlays=${keep# } $overlays" | sed 's/= /=/' >> $env
+		echo "$overlays in $env: reboot to apply them"
+	else
+		echo "no $env (not Armbian?): apply /boot/overlay-user/*.dtbo yourself"
+	fi
+	if udevadm control --reload-rules 2> /dev/null; then
+		udevadm trigger --subsystem-match=mpp_class --subsystem-match=misc --subsystem-match=dma_heap || true
+	fi
+fi

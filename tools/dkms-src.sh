@@ -1,78 +1,83 @@
 #!/usr/bin/env bash
-# DKMS sources of rk_vcodec, rga3 and rknpu from the patched tree, into $OUT_DIR/dkms/.
+# The three drivers' DKMS sources, from our patches alone: each zz-opi5-*.patch applied to an
+# empty tree, only the drivers' paths. The Makefile runs it; needs git and bash.
 #
-#   tools/dkms-src.sh [src]   # default work/kernel
+#   tools/dkms-src.sh [out] [--against tree]   # out defaults to out/src
 #
-# Version: v6.18.63-1 gives 6.18.63.1, then +<n>.g<commit>[.dirty]. $DKMS_VERSION
-# overrides it; $GIT_DESCRIBE replaces git describe where git can't read the repository.
+# --against: also take the same files from a patched kernel tree (the queue, or check's),
+# and fail unless both agree, and unless dkms/rknpu/governor.h is still the tree's.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-src=${1:-$here/work/kernel}
-out=${OUT_DIR:-$here/out}/dkms
-armbian=${ARMBIAN_DIR:-$here/work/armbian}
+out=$here/out/src
+against=
+while [[ $# -gt 0 ]]; do
+	case $1 in
+		--against) against=${2:?tree}; shift 2 ;;
+		*) out=$1; shift ;;
+	esac
+done
+patchdirs=("$here"/userpatches/kernel/archive/rockchip64-*)
+[[ ${#patchdirs[@]} -eq 1 ]] || { echo "dkms-src.sh: expected one rockchip64-* patch dir" >&2; exit 1; }
 
-# package module [make arguments]
-packages=(
-	"rk-vcodec rk_vcodec"
-	"rga3 rga3"
-	"rknpu rknpu CONFIG_ROCKCHIP_RKNPU=m"
+# package <tree path> [package path]: a directory's contents go to the top.
+files=(
+	"rk-vcodec drivers/media/platform/rockchip/mpp"
+	"rk-vcodec include/uapi/linux/rk-mpp.h include/uapi/linux/rk-mpp.h"
+	"rga3 drivers/media/platform/rockchip/rga/rga3"
+	"rknpu drivers/rknpu"
 )
 
-version=${DKMS_VERSION:-}
-if [[ -z $version ]]; then
-	describe=${GIT_DESCRIBE:-$(git -C "$here" describe --tags --match 'v*' --dirty 2> /dev/null || true)}
-	re='^v([0-9.]+)-([0-9]+)(-([0-9]+)-g([0-9a-f]+))?(-dirty)?$'
-	[[ $describe =~ $re ]] || { echo "dkms-src.sh: no version from '$describe'; set DKMS_VERSION" >&2; exit 1; }
-	version=${BASH_REMATCH[1]}.${BASH_REMATCH[2]}
-	extra=()
-	[[ -n ${BASH_REMATCH[3]} ]] && extra+=("${BASH_REMATCH[4]}" "g${BASH_REMATCH[5]}")
-	[[ -n ${BASH_REMATCH[6]} ]] && extra+=(dirty)
-	if [[ ${#extra[@]} -gt 0 ]]; then
-		version+=+$(IFS=.; echo "${extra[*]}")
-	fi
-fi
-
-if [[ -d $src/.git ]]; then
-	bash "$here/tools/queue.sh" check "$src"
-else
-	ARMBIAN_DIR=$armbian bash "$here/tools/queue.sh" import "$src"
-fi
-
-# copy <package> <tree path> [package path]: a directory's contents go to the top.
-copy() {
-	local dst=$out/$1-$version
-	if [[ -n ${3:-} ]]; then
-		mkdir -p "$(dirname "$dst/$3")"
-		cp "$src/$2" "$dst/$3"
-	else
-		mkdir -p "$dst"
-		cp -R "$src/$2/." "$dst"
-	fi
+# sources <tree> <dst>: the packages from a patched tree, plus ours from dkms/.
+sources() {
+	local tree=$1 dst=$2 entry pkg path to dir
+	rm -rf "$dst"
+	for entry in "${files[@]}"; do
+		read -r pkg path to <<< "$entry"
+		if [[ -n $to ]]; then
+			mkdir -p "$(dirname "$dst/$pkg/$to")"
+			cp "$tree/$path" "$dst/$pkg/$to"
+		else
+			mkdir -p "$dst/$pkg"
+			cp -R "$tree/$path/." "$dst/$pkg"
+		fi
+	done
+	# Headers packages don't ship drivers/.
+	cp "$here/dkms/rknpu/governor.h" "$here/dkms/rknpu/devfreq-governor.h" "$dst/rknpu/src/include/compat/linux/"
+	for dir in "$dst"/*/; do
+		rm -f "$dir/Kconfig" "$dir"/*_kunit.c
+		pkg=$(basename "$dir")
+		[[ -f $here/dkms/$pkg/Kbuild ]] || continue
+		# Ours includes the driver's, as Makefile.
+		[[ -f $dir/Makefile ]] || mv "$dir/Kbuild" "$dir/Makefile"
+		cp "$here/dkms/$pkg/Kbuild" "$dir"
+	done
 }
 
-rm -rf "$out"
-mkdir -p "$out"
-
-copy rk-vcodec drivers/media/platform/rockchip/mpp
-copy rk-vcodec include/uapi/linux/rk-mpp.h include/uapi/linux/rk-mpp.h
-copy rga3 drivers/media/platform/rockchip/rga/rga3
-copy rknpu drivers/rknpu
-# Headers packages don't ship drivers/.
-copy rknpu drivers/devfreq/governor.h src/include/compat/linux/governor.h
-cp "$here/dkms/rknpu/devfreq-governor.h" "$out/rknpu-$version/src/include/compat/linux/"
-
-for entry in "${packages[@]}"; do
-	read -r pkg module make_args <<< "$entry"
-	dir=$out/$pkg-$version
-	rm -f "$dir/Kconfig" "$dir"/*_kunit.c
-	if [[ -f $here/dkms/$pkg/Kbuild ]]; then
-		cp "$here/dkms/$pkg/Kbuild" "$dir/"
-	fi
-	sed -e "s/@PACKAGE@/$pkg/" -e "s/@MODULE@/$module/" -e "s/@VERSION@/$version/" \
-		-e "s/@MAKE_ARGS@/${make_args:+$make_args }/" "$here/dkms/dkms.conf.in" > "$dir/dkms.conf"
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+includes=()
+for entry in "${files[@]}"; do
+	read -r pkg path to <<< "$entry"
+	# A file, or a directory's files (* crosses /).
+	if [[ -n $to ]]; then includes+=("--include=$path"); else includes+=("--include=$path/*"); fi
 done
+# Outside any repository, so paths are the tree's.
+mkdir "$tmp/tree"
+for p in "${patchdirs[0]}"/zz-opi5-*.patch; do
+	git -C "$tmp/tree" apply --whitespace=nowarn "${includes[@]}" "$p" ||
+		{ echo "dkms-src.sh: ${p##*/} doesn't apply" >&2; exit 1; }
+done
+sources "$tmp/tree" "$out"
 
+if [[ -n $against ]]; then
+	sources "$against" "$tmp/against"
+	diff -r "$tmp/against" "$out" || { echo "dkms-src.sh: the patches alone differ from $against" >&2; exit 1; }
+	# Our copy, which sources() puts on both sides, against the kernel's.
+	diff "$against/drivers/devfreq/governor.h" "$here/dkms/rknpu/governor.h" ||
+		{ echo "dkms-src.sh: dkms/rknpu/governor.h differs from $against's; copy it" >&2; exit 1; }
+	echo "dkms-src: the patches alone match $against"
+fi
 if [[ $EUID -eq 0 ]]; then
 	chown -R --reference="$here" "$out"
 fi

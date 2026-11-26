@@ -6,11 +6,22 @@ Armbian's "current" kernel (6.18) for the **Orange Pi 5 Pro** (RK3588S), with Ro
 - **multi-RGA** (`/dev/rga`): both RGA3 cores and RGA2;
 - **RKNPU 0.9.8** (`/dev/rknpu`): all three NPU cores, for Rockchip's `librknnrt`.
 
-It's an Armbian [`userpatches/`](userpatches/) directory: patches, device tree, one extension, one build config.
+It's an Armbian [`userpatches/`](userpatches/) directory: patches, device tree, one extension, one build config. The same drivers also install alone on Armbian's own kernel, with DKMS.
 
 It also has a fix for Armbian's U-Boot on this board, which leaves the PCIe slot powered and its link up when Linux starts: the YT6801 Ethernet then fails on about half of the boots. See [U-Boot](#u-boot).
 
 ## Use
+
+**Drivers only, on Armbian's kernel.** On an Armbian `current` (or `edge`) install, keeping Armbian's kernel and its updates:
+
+```sh
+apt install git dkms device-tree-compiler linux-headers-current-rockchip64
+git clone --depth 1 https://github.com/ramcguire/orangepi5pro-vendor-drivers && cd orangepi5pro-vendor-drivers
+sudo make install
+reboot
+```
+
+`make install` builds the package and installs it; or `apt install` a release's `orangepi5pro-vendor-drivers_*.deb`. DKMS builds the three modules, and rebuilds them with each kernel update's headers. Overlays (`user_overlays` in `armbianEnv.txt`) add the device tree nodes, and the udev rule opens the devices. `sudo make uninstall` or `apt remove` undoes it. A failed rebuild doesn't stop a kernel update, which then boots without the drivers; CI's scheduled check fails first, so hold the kernel then. Not for the kernel packages below, which have the drivers.
 
 **Packages.** Each [release](../../releases) has the `linux-image`, `linux-dtb` and `linux-headers` packages. On an Armbian `current` install for the Orange Pi 5 Pro:
 
@@ -36,24 +47,24 @@ reboot
 
 To undo it, write the saved one back with `dd if=/root/bootarea.img of="$dev" bs=32k skip=1 seek=1 count=511 conv=notrunc`. For U-Boot in SPI flash, use `armbian-install` instead.
 
-**Userspace.** For the codecs and RGA, use FFmpeg built with rkmpp and librga. NPU clients need `/dev/rknpu`, `/dev/dma_heap` and `librknnrt` 2.3.2; 2.3.0 times out every job on this driver. Each release's `60-rockchip-vendor.rules`, in `/etc/udev/rules.d/`, opens MPP and RGA to `video`, and the NPU and DMA heaps to `render`.
+**Userspace.** For the codecs and RGA, use FFmpeg built with rkmpp and librga. NPU clients need `/dev/rknpu`, `/dev/dma_heap` and `librknnrt` 2.3.2; 2.3.0 times out every job on this driver. The udev rule `60-rockchip-vendor.rules` opens MPP and RGA to `video`, and the NPU and DMA heaps to `render`. The drivers-only install has it; with the kernel packages, put the release's copy in `/etc/udev/rules.d/`.
 
 **Build with Armbian.** Copy `userpatches/` (or a release's `opi5-userpatches-*.tar.gz`) into [armbian/build](https://github.com/armbian/build) at the tag `build.sh` pins, then run `./compile.sh opi5 kernel` (and `./compile.sh opi5 uboot`). To add the drivers to another build, copy `kernel/archive/rockchip64-6.18/` and `extensions/opi5.sh` and set `ENABLE_EXTENSIONS=opi5`.
 
 **Build here.** With Docker and [mise](https://mise.jdx.dev), on any OS, `mise run build` runs `build.sh` in Armbian's builder image. The packages and logs go to `out/`, and caches go to the `opi5-armbian` volume. Arguments after `--` go to `compile.sh`. The other tasks (`mise tasks`):
 
 - `modules`: only the three drivers, their KUnit tests and the DTB, into `out/drivers/`. Uses the config of the package in `out/` if there is one, so they load on that kernel.
-- `check`: applies every patch with Armbian's patcher, failing on any that doesn't apply or of ours that needs fuzz, then compiles the drivers (`tools/patch.sh`).
+- `check`: applies every patch with Armbian's patcher, failing on any that doesn't apply or of ours that needs fuzz, then compiles the drivers (`tools/patch.sh`). It also checks that our patches alone give the same driver sources as that tree, which is how the drivers-only install builds them (`tools/dkms-src.sh`).
 - `kunit`: boots the built package in QEMU and runs every KUnit suite in it (`tools/kunit.sh`).
 - `build -- OPI5_DEBUG=yes`: a test kernel with KASAN, UBSAN, lockdep and DMA API checks, for `kunit` and the abuse tests on the board. Not for release; `build.yml` builds it on a manual run with `debug`.
 - `bump-report`: a report on the last `check`, for bumps (below).
 - `tests`: the abuse tests (Hardening), as static arm64 binaries.
 - `queue-import`, `queue-export`, `shell`: edit the patches as git commits (`tools/queue.sh`). Rewrite them in `mise run shell`, then export.
-- `dkms-src`, `dkms-check`: experimental, the drivers as DKMS on Armbian's own kernel. `dkms-src` writes the sources to `out/dkms/`, versioned from the release tag. `dkms-check` builds them against Armbian's headers packages (`package[=version]`, default the newest `linux-headers-current-rockchip64`).
-- `overlays`: `dt/` as overlays for Armbian's DTB, into `out/overlays/`. Fails unless they reproduce our DTB, node order included.
+- `overlays`: `dt/` as overlays for Armbian's DTB, into `overlays/` (committed, as `dtc` alone builds them there) and `out/overlays/`. Fails unless they reproduce our DTB, node order included. `check` runs it too, and CI fails if `overlays/` is stale.
+- `deb`, `dkms-check`: `deb` builds the drivers-only package (`make deb`). `dkms-check` installs it with Armbian's headers packages (`package[=version]`, default the newest `linux-headers-current-rockchip64`), builds it for each, applies its overlays to the matching `linux-dtb`, checks `user_overlays` and removes it.
 - `lint`, `renovate-check`, `clean`.
 
-**CI.** `check.yml` runs `check` on every push and every third day, which also keeps the caches from expiring. It skips Armbian's patching while the patches and Armbian are unchanged. Commits follow [Conventional Commits](https://www.conventionalcommits.org): hk checks them locally, and `pr-title.yml` checks pull request titles, as pull requests are squash-merged. On `main`, `release.yml` releases when `userpatches/`, `build.sh` or the builder image changed: `build.yml` builds and runs `kunit`, then tags `v<kernel>-<n>` and publishes the release, with notes from the commits (`cliff.toml`). A tag pushed by hand releases too.
+**CI.** `check.yml` runs `check` on every push and every third day, which also keeps the caches from expiring. It skips Armbian's patching while the patches and Armbian are unchanged. It also runs `dkms-check` against Armbian's newest `current` and `edge` (edge only warns). Commits follow [Conventional Commits](https://www.conventionalcommits.org): hk checks them locally, and `pr-title.yml` checks pull request titles, as pull requests are squash-merged. On `main`, `release.yml` releases when `userpatches/`, `build.sh`, the drivers-only package or the builder image changed: `build.yml` builds the packages and runs `kunit`, then tags `v<kernel>-<n>` and publishes the release, with notes from the commits (`cliff.toml`). A tag pushed by hand releases too.
 
 **Bumps** follow Armbian's tags. Renovate moves the Armbian tag, the 6.18.y kernel tag and the builder image together in one pull request on Tuesdays, and we don't patch ahead of Armbian. Everything else (Actions, tools) comes grouped in one pull request, which doesn't release. On those pull requests, `check.yml` adds `tools/bump-report.sh`'s report:
 - Armbian patches that failed;

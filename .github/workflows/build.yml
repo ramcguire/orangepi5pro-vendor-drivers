@@ -100,6 +100,12 @@ jobs:
       - name: KUnit
         run: mise run kunit
 
+      # The drivers alone, for Armbian's own kernel, versioned from the tag.
+      - name: DKMS package
+        env:
+          GIT_DESCRIBE: ${{ env.TAG }}
+        run: mise run deb
+
       - name: Add the userpatches tarball
         env:
           NAME: opi5-userpatches-${{ env.TAG || github.sha }}
@@ -107,7 +113,7 @@ jobs:
           tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@"$(git log -1 --format=%ct)" \
             -czf "out/$NAME.tar.gz" userpatches
           cp udev/*.rules out/
-          (cd out && sha256sum linux-*.deb opi5-userpatches-*.tar.gz ./*.rules > SHA256SUMS && cat SHA256SUMS)
+          (cd out && sha256sum linux-*.deb orangepi5pro-vendor-drivers_*.deb opi5-userpatches-*.tar.gz ./*.rules > SHA256SUMS && cat SHA256SUMS)
 
       - name: Upload
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -150,4 +156,4 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "$TAG" \
             --notes-file "$RUNNER_TEMP/notes.md" \
-            out/linux-*.deb out/opi5-userpatches-*.tar.gz out/*.rules out/SHA256SUMS
+            out/linux-*.deb out/orangepi5pro-vendor-drivers_*.deb out/opi5-userpatches-*.tar.gz out/*.rules out/SHA256SUMS
