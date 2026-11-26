@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0
+# Kconfig values for the out-of-tree build: make variables and -D flags.
+CONFIG_ROCKCHIP_MPP_SERVICE := m
+CONFIG_ROCKCHIP_MPP_PROC_FS := y
+CONFIG_ROCKCHIP_MPP_RKVDEC2 := y
+CONFIG_ROCKCHIP_MPP_RKVENC2 := y
+
+ccflags-y += -DCONFIG_ROCKCHIP_MPP_SERVICE_MODULE=1
+ccflags-y += -DCONFIG_ROCKCHIP_MPP_PROC_FS=1
+ccflags-y += -DCONFIG_ROCKCHIP_MPP_RKVDEC2=1
+ccflags-y += -DCONFIG_ROCKCHIP_MPP_RKVENC2=1
+ccflags-y += -I$(src)/include
+
+include $(src)/Makefile
