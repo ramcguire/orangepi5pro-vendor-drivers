@@ -45,6 +45,7 @@ To undo it, write the saved one back with `dd if=/root/bootarea.img of="$dev" bs
 - `modules`: only the three drivers, their KUnit tests and the DTB, into `out/drivers/`. Uses the config of the package in `out/` if there is one, so they load on that kernel.
 - `check`: applies every patch with Armbian's patcher, failing on any that doesn't apply or of ours that needs fuzz, then compiles the drivers (`tools/patch.sh`).
 - `kunit`: boots the built package in QEMU and runs every KUnit suite in it (`tools/kunit.sh`).
+- `build -- OPI5_DEBUG=yes`: a test kernel with KASAN, UBSAN, lockdep and DMA API checks, for `kunit` and the abuse tests on the board. Not for release; `build.yml` builds it on a manual run with `debug`.
 - `bump-report`: a report on the last `check`, for bumps (below).
 - `tests`: the abuse tests (Hardening), as static arm64 binaries.
 - `queue-import`, `queue-export`, `shell`: edit the patches as git commits (`tools/queue.sh`). Rewrite them in `mise run shell`, then export.

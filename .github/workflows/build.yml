@@ -4,6 +4,11 @@ name: Build
 
 on:
   workflow_dispatch:
+    inputs:
+      debug:
+        description: Debug kernel (OPI5_DEBUG=yes), for KUnit and board tests; never released
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       tag:
@@ -70,22 +75,22 @@ jobs:
 
       - name: Build
         id: build
-        run: mise run build -- SHOW_CCACHE=yes
+        run: mise run build -- SHOW_CCACHE=yes ${{ inputs.debug && 'OPI5_DEBUG=yes' || '' }}
 
       # Only main saves (a tag's caches are its own), and before KUnit, which doesn't
       # change it. Written as root in the container.
       - name: Own ccache
-        if: steps.build.outcome == 'success' && github.ref == 'refs/heads/main'
+        if: steps.build.outcome == 'success' && github.ref == 'refs/heads/main' && !inputs.debug
         run: sudo chown -R "$(id -u):$(id -g)" work/armbian/cache/ccache
 
-      - if: steps.build.outcome == 'success' && github.ref == 'refs/heads/main'
+      - if: steps.build.outcome == 'success' && github.ref == 'refs/heads/main' && !inputs.debug
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: work/armbian/cache/ccache
           key: ${{ steps.ccache.outputs.cache-primary-key }}
 
       - name: Delete superseded ccaches
-        if: steps.build.outcome == 'success' && github.ref == 'refs/heads/main'
+        if: steps.build.outcome == 'success' && github.ref == 'refs/heads/main' && !inputs.debug
         env:
           GH_TOKEN: ${{ github.token }}
           KEY: ${{ steps.ccache.outputs.cache-primary-key }}
@@ -107,13 +112,13 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: opi5-kernel
+          name: opi5-kernel${{ inputs.debug && '-debug' || '' }}
           path: out/
           if-no-files-found: error
 
   release:
     needs: build
-    if: inputs.tag || github.ref_type == 'tag'
+    if: (inputs.tag || github.ref_type == 'tag') && !inputs.debug
     runs-on: ubuntu-24.04
     permissions:
       contents: write
