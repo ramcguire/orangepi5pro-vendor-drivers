@@ -73,6 +73,7 @@ The thousands digit is the purpose.
 | **2xxx: 6.18 under Armbian** | |
 | `2010` | RGA: drops an unexported page-walk fallback, fixes the IOMMU fault handler and DMA segment size |
 | `2020` | The Kconfig/Makefile hooks, the only lines in files mainline or Armbian own |
+| `2030` | RGA: build on 7.x (`strncpy` is gone) |
 | **3xxx: fixes from the board** | |
 | `3010` | RKVDEC2 CCU timeout at 4K: 106.7 → 120 ms |
 | `3020` | MPP: defer a core's probe until its CCU and core 0 are bound; as modules they probed in any order |

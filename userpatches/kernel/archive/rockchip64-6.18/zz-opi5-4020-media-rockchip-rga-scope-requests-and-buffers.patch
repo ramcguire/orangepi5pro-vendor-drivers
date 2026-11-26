@@ -92,7 +92,7 @@ index a75f2470b928..bddb05c9454b 100644
  
  int rga_mm_init(struct rga_mm **session);
 diff --git a/drivers/media/platform/rockchip/rga/rga3/rga_drv.c b/drivers/media/platform/rockchip/rga/rga3/rga_drv.c
-index cfcf8ecb0e84..eab44f0de8be 100644
+index 5bc4cda16148..cbd2e16c6127 100644
 --- a/drivers/media/platform/rockchip/rga/rga3/rga_drv.c
 +++ b/drivers/media/platform/rockchip/rga/rga3/rga_drv.c
 @@ -243,11 +243,11 @@ int rga_mpi_commit(struct rga_mpi_job_t *mpi_job)
