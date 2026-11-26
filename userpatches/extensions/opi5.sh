@@ -44,6 +44,19 @@ declare -g -a OPI5_KERNEL_CONFIG=(
 	ROCKCHIP_RGA_KUNIT_TEST=m
 )
 
+# OPI5_DEBUG=yes: a test kernel that reports memory errors, undefined behaviour, locking and
+# DMA API misuse. Not for release.
+if [[ "${OPI5_DEBUG:-}" == yes ]]; then
+	OPI5_KERNEL_CONFIG+=(
+		KASAN=y
+		UBSAN=y
+		UBSAN_BOUNDS=y
+		PROVE_LOCKING=y
+		DEBUG_ATOMIC_SLEEP=y
+		DMA_API_DEBUG=y
+	)
+fi
+
 # Each option leaves Armbian's other opts_* arrays first, so ours win.
 function custom_kernel_config__opi5() {
 	declare option symbol value array item

@@ -7,7 +7,8 @@
 # of the test modules (every module that needs kunit.ko) and tools/kunit-init.c as /init,
 # which loads them (KUnit runs a module's suites as it loads) and prints each suite's
 # results. Fails unless every module loads, there are at least as many suites as test
-# modules, no test fails, and the kernel logs no BUG:, Oops, panic or KASAN report.
+# modules, no test fails, and the kernel logs no BUG:, Oops, panic, or KASAN, UBSAN, lockdep
+# or DMA-API report.
 #
 # The console log and the results are kept in $OUT_DIR/kunit/. Needs the builder image's
 # cross compiler and cpio; installs qemu-system-arm from Debian if it's missing.
@@ -97,7 +98,7 @@ fail() { echo "::error::$*"; status=1; }
 grep -q '^kunit-init: done$' "$results/console.log" || fail "/init didn't finish (see $results/console.log)"
 while IFS= read -r line; do fail "${line#kunit-init: error: }"; done < <(grep '^kunit-init: error: ' "$results/console.log" || true)
 while IFS= read -r line; do fail "kernel: $line"; done < <(
-	grep -E 'BUG:|Oops|Kernel panic|Unable to handle kernel|KASAN|kernel BUG at' "$results/console.log" || true)
+	grep -E 'BUG:|Oops|Kernel panic|Unable to handle kernel|KASAN|kernel BUG at|UBSAN:|DMA-API:|possible (circular|recursive) locking|inconsistent lock state|suspicious RCU usage' 		"$results/console.log" || true)
 
 suites=("$results"/*.ktap)
 [[ -f ${suites[0]} ]] || suites=()
