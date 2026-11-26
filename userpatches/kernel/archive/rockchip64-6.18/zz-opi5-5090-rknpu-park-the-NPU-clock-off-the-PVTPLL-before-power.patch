@@ -1,0 +1,210 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: opi5 <noreply@example.invalid>
+Date: Wed, 25 Nov 2026 00:00:00 +0000
+Subject: [PATCH] rknpu: park the NPU clock off the PVTPLL before power-off
+
+TF-A runs every NPU OPP from the PVTPLL, which loses its setup when
+PD_NPUTOP goes off; the next power-on then hangs the SoC. Park at
+200 MHz (GPLL) before power-off and system sleep, and restore the rate
+after, as the vendor kernel does.
+---
+ drivers/rknpu/src/include/rknpu_devfreq.h | 11 +++++
+ drivers/rknpu/src/include/rknpu_drv.h     |  4 ++
+ drivers/rknpu/src/rknpu_devfreq.c         | 57 ++++++++++++++++++++++-
+ drivers/rknpu/src/rknpu_drv.c             | 27 +++++++++++
+ 4 files changed, 98 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/rknpu/src/include/rknpu_devfreq.h b/drivers/rknpu/src/include/rknpu_devfreq.h
+index 717a5effca91..a99e9d55669c 100644
+--- a/drivers/rknpu/src/include/rknpu_devfreq.h
++++ b/drivers/rknpu/src/include/rknpu_devfreq.h
+@@ -10,6 +10,8 @@
+ #if defined(CONFIG_PM_DEVFREQ) && !defined(RKNPU_NO_DEVFREQ)
+ void rknpu_devfreq_lock(struct rknpu_device *rknpu_dev);
+ void rknpu_devfreq_apply_pending(struct rknpu_device *rknpu_dev);
++int rknpu_devfreq_park(struct rknpu_device *rknpu_dev);
++void rknpu_devfreq_unpark(struct rknpu_device *rknpu_dev);
+ void rknpu_devfreq_unlock(struct rknpu_device *rknpu_dev);
+ int rknpu_devfreq_init(struct rknpu_device *rknpu_dev);
+ void rknpu_devfreq_remove(struct rknpu_device *rknpu_dev);
+@@ -37,6 +39,15 @@ static inline void rknpu_devfreq_apply_pending(struct rknpu_device *rknpu_dev)
+ {
+ }
+ 
++static inline int rknpu_devfreq_park(struct rknpu_device *rknpu_dev)
++{
++	return 0;
++}
++
++static inline void rknpu_devfreq_unpark(struct rknpu_device *rknpu_dev)
++{
++}
++
+ static inline int rknpu_devfreq_runtime_suspend(struct device *dev)
+ {
+ 	return 0;
+diff --git a/drivers/rknpu/src/include/rknpu_drv.h b/drivers/rknpu/src/include/rknpu_drv.h
+index 1b708b358205..0538d3331827 100644
+--- a/drivers/rknpu/src/include/rknpu_drv.h
++++ b/drivers/rknpu/src/include/rknpu_drv.h
+@@ -153,6 +153,10 @@ struct rknpu_device {
+ 	/* opi5: under devfreq_lock; see npu_devfreq_target() */
+ 	bool powered;
+ 	bool freq_pending;
++	/* opi5: under devfreq_lock; see rknpu_devfreq_park() */
++	bool rate_applied;
++	bool parked;
++	unsigned long applied_freq;
+ 	int bypass_irq_handler;
+ 	int bypass_soft_reset;
+ 	bool soft_reseting;
+diff --git a/drivers/rknpu/src/rknpu_devfreq.c b/drivers/rknpu/src/rknpu_devfreq.c
+index dbc0dcbf1146..57d2041ce3da 100644
+--- a/drivers/rknpu/src/rknpu_devfreq.c
++++ b/drivers/rknpu/src/rknpu_devfreq.c
+@@ -108,6 +108,8 @@ static int npu_devfreq_target(struct device *dev, unsigned long *freq,
+ 	ret = dev_pm_opp_set_rate(dev, *freq);
+ 	clk_bulk_disable_unprepare(rknpu_dev->num_clks, rknpu_dev->clks);
+ 	if (!ret) {
++		rknpu_dev->rate_applied = true;
++		rknpu_dev->applied_freq = *freq;
+ 		rknpu_dev->current_freq = *freq;
+ 		if (rknpu_dev->devfreq)
+ 			rknpu_dev->devfreq->last_status.current_frequency =
+@@ -131,7 +133,10 @@ void rknpu_devfreq_apply_pending(struct rknpu_device *rknpu_dev)
+ 		return;
+ 	rknpu_dev->freq_pending = false;
+ 	ret = dev_pm_opp_set_rate(rknpu_dev->dev, rknpu_dev->current_freq);
+-	if (ret) {
++	if (!ret) {
++		rknpu_dev->rate_applied = true;
++		rknpu_dev->applied_freq = rknpu_dev->current_freq;
++	} else {
+ 		LOG_DEV_WARN(rknpu_dev->dev,
+ 			     "failed to set deferred rknpu freq %lu: %d\n",
+ 			     rknpu_dev->current_freq, ret);
+@@ -141,6 +146,56 @@ void rknpu_devfreq_apply_pending(struct rknpu_device *rknpu_dev)
+ }
+ EXPORT_SYMBOL(rknpu_devfreq_apply_pending);
+ 
++/*
++ * opi5: TF-A runs every NPU OPP from the PVTPLL, inside PD_NPUTOP, which
++ * loses its setup when the domain goes off; the next power-on then hangs
++ * the SoC. Park at 200 MHz (GPLL) first, as the vendor kernel does. Only
++ * after a rate was applied: TF-A can't restore the boot rate.
++ * NPU on, devfreq_lock held. Fails if the clock is still on the PVTPLL.
++ */
++#define RKNPU_PARK_FREQ 200000000UL
++
++int rknpu_devfreq_park(struct rknpu_device *rknpu_dev)
++{
++	int ret;
++
++	if (!rknpu_dev->rate_applied || rknpu_dev->parked ||
++	    !rknpu_dev->num_clks)
++		return 0;
++	ret = clk_set_rate(rknpu_dev->clks[0].clk, RKNPU_PARK_FREQ);
++	if (ret) {
++		LOG_DEV_ERROR(rknpu_dev->dev,
++			      "failed to park rknpu clock at %lu: %d\n",
++			      RKNPU_PARK_FREQ, ret);
++		return ret;
++	}
++	rknpu_dev->parked = true;
++	return 0;
++}
++EXPORT_SYMBOL(rknpu_devfreq_park);
++
++/*
++ * opi5: restore the OPP core's last rate. NPU on, devfreq_lock held;
++ * before rknpu_devfreq_apply_pending().
++ */
++void rknpu_devfreq_unpark(struct rknpu_device *rknpu_dev)
++{
++	int ret;
++
++	if (!rknpu_dev->parked)
++		return;
++	rknpu_dev->parked = false;
++	ret = clk_set_rate(rknpu_dev->clks[0].clk, rknpu_dev->applied_freq);
++	if (ret) {
++		/* Still at the parked rate, on the CRU path. */
++		rknpu_dev->rate_applied = false;
++		LOG_DEV_WARN(rknpu_dev->dev,
++			     "failed to restore rknpu freq %lu: %d\n",
++			     rknpu_dev->applied_freq, ret);
++	}
++}
++EXPORT_SYMBOL(rknpu_devfreq_unpark);
++
+ static int npu_devfreq_get_dev_status(struct device *dev,
+ 				      struct devfreq_dev_status *stat)
+ {
+diff --git a/drivers/rknpu/src/rknpu_drv.c b/drivers/rknpu/src/rknpu_drv.c
+index b2b324b56ad0..34ca09b1ce82 100644
+--- a/drivers/rknpu/src/rknpu_drv.c
++++ b/drivers/rknpu/src/rknpu_drv.c
+@@ -1075,6 +1075,7 @@ static int rknpu_power_on(struct rknpu_device *rknpu_dev)
+ #ifndef FPGA_PLATFORM
+ 	/* opi5: see npu_devfreq_target() */
+ 	rknpu_dev->powered = true;
++	rknpu_devfreq_unpark(rknpu_dev);
+ 	rknpu_devfreq_apply_pending(rknpu_dev);
+ 	rknpu_devfreq_unlock(rknpu_dev);
+ #endif
+@@ -1116,6 +1117,14 @@ static int rknpu_power_off(struct rknpu_device *rknpu_dev)
+ 	/* opi5: from here devfreq only records the rate; see
+ 	 * npu_devfreq_target() */
+ 	rknpu_dev->powered = false;
++	/* opi5: the domains must not go off on the PVTPLL; see
++	 * rknpu_devfreq_park(). If it can't park, leave the NPU on. */
++	ret = rknpu_devfreq_park(rknpu_dev);
++	if (ret) {
++		rknpu_dev->powered = true;
++		rknpu_devfreq_unlock(rknpu_dev);
++		return ret;
++	}
+ #endif
+ 
+ 	pm_runtime_put_sync(dev);
+@@ -1138,6 +1147,7 @@ static int rknpu_power_off(struct rknpu_device *rknpu_dev)
+ 			LOG_DEV_ERROR(dev, "iommu still enabled\n");
+ 			pm_runtime_get_sync(dev);
+ 			rknpu_dev->powered = true;
++			rknpu_devfreq_unpark(rknpu_dev);
+ 			rknpu_devfreq_unlock(rknpu_dev);
+ 			return ret;
+ 		}
+@@ -1844,8 +1854,20 @@ static int rknpu_suspend(struct device *dev)
+ 	if (ret)
+ 		return ret;
+ 
++	/* opi5: the domains go off in suspend; see rknpu_devfreq_park() */
++	rknpu_devfreq_lock(rknpu_dev);
++	ret = rknpu_devfreq_park(rknpu_dev);
++	rknpu_devfreq_unlock(rknpu_dev);
++	if (ret) {
++		rknpu_power_put(rknpu_dev);
++		return ret;
++	}
++
+ 	ret = pm_runtime_force_suspend(dev);
+ 	if (ret) {
++		rknpu_devfreq_lock(rknpu_dev);
++		rknpu_devfreq_unpark(rknpu_dev);
++		rknpu_devfreq_unlock(rknpu_dev);
+ 		rknpu_power_put(rknpu_dev);
+ 		return ret;
+ 	}
+@@ -1857,6 +1879,11 @@ static int rknpu_resume(struct device *dev)
+ {
+ 	struct rknpu_device *rknpu_dev = dev_get_drvdata(dev);
+ 
++	/* opi5: genpd powered the domains back on in resume_noirq;
++	 * the hold from rknpu_suspend() keeps them on. */
++	rknpu_devfreq_lock(rknpu_dev);
++	rknpu_devfreq_unpark(rknpu_dev);
++	rknpu_devfreq_unlock(rknpu_dev);
+ 	rknpu_power_put_delay(rknpu_dev);
+ 
+ 	return pm_runtime_force_resume(dev);

@@ -86,6 +86,10 @@ The thousands digit is the purpose.
 | `5030` | Power off once the IOMMU has actually suspended; the NPU was never clock-gated |
 | `5040` | Free a client's imported buffers when it closes |
 | `5050` | NPU: harden user input (ours) |
+| `5060` | Power off after probe from the delayed work; at probe the IOMMU can't suspend |
+| `5070` | Defer rate changes while the NPU is off |
+| `5080` | Release the NPU domains and clocks once the IOMMU has suspended |
+| `5090` | Park the NPU clock at 200 MHz (GPLL) before power-off; the PVT-PLL loses its setup and the next power-on hangs. 5060-5080 need it |
 | **6xxx: KUnit tests (ours)** | Modules only. Loading one runs it and taints the kernel |
 | `6010` | `mpp_kunit`: the ABI (1010), command filter, request bounds (4010), CCU timeout (3010). With `CONFIG_KUNIT`, the functions under test are exported in `EXPORTED_FOR_KUNIT_TESTING` |
 | `6020` | `rga_kunit`: the request filter, one base address per buffer (2010). `rga3.ko` won't load without RGA cores, so the checks are header inlines the test includes |
@@ -126,6 +130,7 @@ With them, Ethernet came up on 14 of 14 boots, against 15 of 32 without. Armbian
 - RGA2 is untested: no workload has reached it.
 - Keep suspend off: an earlier build hung on resume.
 - An NPU client that keeps timing out can freeze the board (librknnrt 2.3.0). Use 2.3.2.
+- Don't write `on` to `/sys/devices/platform/fdab9000.iommu/power/control` while the NPU is off: the IOMMU would touch unpowered NPU cores.
 
 ## License
 
