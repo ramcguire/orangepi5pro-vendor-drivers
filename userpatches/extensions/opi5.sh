@@ -34,7 +34,7 @@ declare -g -a OPI5_KERNEL_CONFIG=(
 	DEFAULT_HUNG_TASK_TIMEOUT=120
 	BOOTPARAM_HUNG_TASK_PANIC=n
 
-	# NPU (5010-5050): rknpu.ko. Rocket binds the same hardware; librknnrt needs /dev/rknpu.
+	# NPU (5010-5090): rknpu.ko. Rocket binds the same hardware; librknnrt needs /dev/rknpu.
 	ROCKCHIP_RKNPU=m
 	DRM_ACCEL_ROCKET=n
 

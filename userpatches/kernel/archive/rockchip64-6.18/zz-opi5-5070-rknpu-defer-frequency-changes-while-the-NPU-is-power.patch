@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: opi5 <noreply@example.invalid>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH] rknpu: defer frequency changes while the NPU is powered off
+
+A rate change with the NPU powered off hangs the SoC. While off, record
+the rate; power-on applies it once everything is on.
+---
+ drivers/rknpu/src/include/rknpu_devfreq.h |  5 ++++
+ drivers/rknpu/src/include/rknpu_drv.h     |  3 +++
+ drivers/rknpu/src/rknpu_devfreq.c         | 33 +++++++++++++++++++++++
+ drivers/rknpu/src/rknpu_drv.c             |  7 +++++
+ 4 files changed, 48 insertions(+)
+
+diff --git a/drivers/rknpu/src/include/rknpu_devfreq.h b/drivers/rknpu/src/include/rknpu_devfreq.h
+index 34caf4d77e9e..717a5effca91 100644
+--- a/drivers/rknpu/src/include/rknpu_devfreq.h
++++ b/drivers/rknpu/src/include/rknpu_devfreq.h
+@@ -9,6 +9,7 @@
+ 
+ #if defined(CONFIG_PM_DEVFREQ) && !defined(RKNPU_NO_DEVFREQ)
+ void rknpu_devfreq_lock(struct rknpu_device *rknpu_dev);
++void rknpu_devfreq_apply_pending(struct rknpu_device *rknpu_dev);
+ void rknpu_devfreq_unlock(struct rknpu_device *rknpu_dev);
+ int rknpu_devfreq_init(struct rknpu_device *rknpu_dev);
+ void rknpu_devfreq_remove(struct rknpu_device *rknpu_dev);
+@@ -32,6 +33,10 @@ static inline void rknpu_devfreq_unlock(struct rknpu_device *rknpu_dev)
+ {
+ }
+ 
++static inline void rknpu_devfreq_apply_pending(struct rknpu_device *rknpu_dev)
++{
++}
++
+ static inline int rknpu_devfreq_runtime_suspend(struct device *dev)
+ {
+ 	return 0;
+diff --git a/drivers/rknpu/src/include/rknpu_drv.h b/drivers/rknpu/src/include/rknpu_drv.h
+index ec4ae3b5c7a0..1b708b358205 100644
+--- a/drivers/rknpu/src/include/rknpu_drv.h
++++ b/drivers/rknpu/src/include/rknpu_drv.h
+@@ -150,6 +150,9 @@ struct rknpu_device {
+ 	struct rockchip_opp_info opp_info;
+ 	unsigned long current_freq;
+ 	unsigned long current_volt;
++	/* opi5: under devfreq_lock; see npu_devfreq_target() */
++	bool powered;
++	bool freq_pending;
+ 	int bypass_irq_handler;
+ 	int bypass_soft_reset;
+ 	bool soft_reseting;
+diff --git a/drivers/rknpu/src/rknpu_devfreq.c b/drivers/rknpu/src/rknpu_devfreq.c
+index b07d84ef7e1e..dbc0dcbf1146 100644
+--- a/drivers/rknpu/src/rknpu_devfreq.c
++++ b/drivers/rknpu/src/rknpu_devfreq.c
+@@ -76,6 +76,20 @@ static int npu_devfreq_target(struct device *dev, unsigned long *freq,
+ 		return 0;
+ 
+ 	mutex_lock(&rknpu_dev->devfreq_lock);
++	/*
++	 * opi5: while the NPU is off, only record the rate; rknpu_power_on()
++	 * applies it. A rate change with the NPU off hangs the SoC.
++	 */
++	if (!rknpu_dev->powered) {
++		rknpu_dev->current_freq = *freq;
++		rknpu_dev->current_volt = opp_volt;
++		rknpu_dev->freq_pending = true;
++		if (rknpu_dev->devfreq)
++			rknpu_dev->devfreq->last_status.current_frequency =
++				*freq;
++		mutex_unlock(&rknpu_dev->devfreq_lock);
++		return 0;
++	}
+ 	/*
+ 	 * TF-A's SCMI CLK_NPU set_rate programs the NPU PVTPLL through
+ 	 * the NPU GRF (APB). If the NPU housekeeping clocks (notably
+@@ -108,6 +122,25 @@ static int npu_devfreq_target(struct device *dev, unsigned long *freq,
+ 	return ret;
+ }
+ 
++/* opi5: apply the rate recorded while off. NPU on, devfreq_lock held. */
++void rknpu_devfreq_apply_pending(struct rknpu_device *rknpu_dev)
++{
++	int ret;
++
++	if (!rknpu_dev->freq_pending)
++		return;
++	rknpu_dev->freq_pending = false;
++	ret = dev_pm_opp_set_rate(rknpu_dev->dev, rknpu_dev->current_freq);
++	if (ret) {
++		LOG_DEV_WARN(rknpu_dev->dev,
++			     "failed to set deferred rknpu freq %lu: %d\n",
++			     rknpu_dev->current_freq, ret);
++		rknpu_dev->current_freq =
++			clk_get_rate(rknpu_dev->clks[0].clk);
++	}
++}
++EXPORT_SYMBOL(rknpu_devfreq_apply_pending);
++
+ static int npu_devfreq_get_dev_status(struct device *dev,
+ 				      struct devfreq_dev_status *stat)
+ {
+diff --git a/drivers/rknpu/src/rknpu_drv.c b/drivers/rknpu/src/rknpu_drv.c
+index bb3355fedc35..185049525399 100644
+--- a/drivers/rknpu/src/rknpu_drv.c
++++ b/drivers/rknpu/src/rknpu_drv.c
+@@ -1072,6 +1072,9 @@ static int rknpu_power_on(struct rknpu_device *rknpu_dev)
+ 		rknpu_dev->config->state_init(rknpu_dev);
+ 
+ #ifndef FPGA_PLATFORM
++	/* opi5: see npu_devfreq_target() */
++	rknpu_dev->powered = true;
++	rknpu_devfreq_apply_pending(rknpu_dev);
+ 	rknpu_devfreq_unlock(rknpu_dev);
+ #endif
+ 
+@@ -1109,6 +1112,9 @@ static int rknpu_power_off(struct rknpu_device *rknpu_dev)
+ 	bool val;
+ 
+ 	rknpu_devfreq_lock(rknpu_dev);
++	/* opi5: from here devfreq only records the rate; see
++	 * npu_devfreq_target() */
++	rknpu_dev->powered = false;
+ #endif
+ 
+ 	pm_runtime_put_sync(dev);
+@@ -1130,6 +1136,7 @@ static int rknpu_power_off(struct rknpu_device *rknpu_dev)
+ 		if (ret) {
+ 			LOG_DEV_ERROR(dev, "iommu still enabled\n");
+ 			pm_runtime_get_sync(dev);
++			rknpu_dev->powered = true;
+ 			rknpu_devfreq_unlock(rknpu_dev);
+ 			return ret;
+ 		}

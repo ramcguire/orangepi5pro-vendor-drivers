@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: opi5 <noreply@example.invalid>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH] rknpu: power off after probe from the delayed work
+
+The power-off at the end of probe waits for the IOMMU to suspend, but
+the driver core keeps it resumed until probe returns. The wait timed out
+and leaked a runtime PM reference, so the NPU never powered off. Power
+off from the delayed work instead.
+---
+ drivers/rknpu/src/rknpu_drv.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/rknpu/src/rknpu_drv.c b/drivers/rknpu/src/rknpu_drv.c
+index f6129778bc8f..bb3355fedc35 100644
+--- a/drivers/rknpu/src/rknpu_drv.c
++++ b/drivers/rknpu/src/rknpu_drv.c
+@@ -1700,8 +1700,12 @@ static int rknpu_probe(struct platform_device *pdev)
+ 	if (rknpu_dev->iommu_en)
+ 		rknpu_iommu_init_domain(rknpu_dev);
+ 
+-	rknpu_power_off(rknpu_dev);
+-	atomic_set(&rknpu_dev->power_refcount, 0);
++	/*
++	 * opi5: power off from the delayed work: the driver core keeps the IOMMU
++	 * resumed until probe returns.
++	 */
++	atomic_set(&rknpu_dev->power_refcount, 1);
++	rknpu_power_put_delay(rknpu_dev);
+ 	atomic_set(&rknpu_dev->cmdline_power_refcount, 0);
+ 	atomic_set(&rknpu_dev->iommu_domain_refcount, 0);
+ 
