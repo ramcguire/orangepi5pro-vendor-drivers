@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: opi5 <noreply@example.invalid>
+Date: Thu, 26 Nov 2026 00:00:00 +0000
+Subject: [PATCH] media: rockchip: rga: copy the driver version with
+ strscpy_pad
+
+7.x dropped strncpy(). strscpy_pad() keeps the zero fill, as the field
+goes to userspace.
+---
+ drivers/media/platform/rockchip/rga/rga3/rga_drv.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/media/platform/rockchip/rga/rga3/rga_drv.c b/drivers/media/platform/rockchip/rga/rga3/rga_drv.c
+index cfcf8ecb0e84..5bc4cda16148 100644
+--- a/drivers/media/platform/rockchip/rga/rga3/rga_drv.c
++++ b/drivers/media/platform/rockchip/rga/rga3/rga_drv.c
+@@ -1047,7 +1047,7 @@ static long rga_ioctl(struct file *file, uint32_t cmd, unsigned long arg)
+ 		driver_version.major = DRIVER_MAJOR_VERISON;
+ 		driver_version.minor = DRIVER_MINOR_VERSION;
+ 		driver_version.revision = DRIVER_REVISION_VERSION;
+-		strncpy((char *)driver_version.str, DRIVER_VERSION, sizeof(driver_version.str));
++		strscpy_pad((char *)driver_version.str, DRIVER_VERSION, sizeof(driver_version.str));
+ 
+ 		if (copy_to_user((void *)arg, &driver_version, sizeof(driver_version)))
+ 			ret = -EFAULT;
