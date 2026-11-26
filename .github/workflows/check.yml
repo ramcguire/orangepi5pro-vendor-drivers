@@ -35,7 +35,10 @@ jobs:
         work/armbian/cache/opi5-patch.key
         work/armbian/cache/ccache
     steps:
+      # The tags, for the DKMS version.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
       - uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
 
@@ -58,6 +61,15 @@ jobs:
 
       - name: Apply the patches and compile the drivers
         run: mise run check
+
+      - name: DKMS sources
+        run: mise run dkms-src
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dkms-src
+          path: out/dkms/
+          if-no-files-found: error
 
       # On Renovate's bumps, also when the check failed: the report shows why.
       - name: Bump report
@@ -82,6 +94,38 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           KEY: ${{ steps.cache.outputs.cache-primary-key }}
         run: tools/cache-prune.sh check- "$KEY"
+
+  # The DKMS sources against Armbian's published headers. Edge only warns.
+  dkms:
+    needs: check
+    runs-on: ubuntu-24.04-arm
+    continue-on-error: ${{ matrix.branch == 'edge' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: [current, edge]
+    env:
+      MISE_TASK_RUN_AUTO_INSTALL: "false"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
+        with:
+          install: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: dkms-src
+          path: out/dkms
+
+      - name: Build
+        run: mise run dkms-check -- "linux-headers-${{ matrix.branch }}-rockchip64"
+
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dkms-check-${{ matrix.branch }}
+          path: out/dkms-check/*/
 
   # Restores build.yml's ccache, so it isn't evicted between weekly builds.
   keep-ccache:
