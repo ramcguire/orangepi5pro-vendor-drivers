@@ -74,7 +74,7 @@ run = [
 ]
 
 [tasks.bump-report]
-description = "Markdown report on the last check: Armbian patches failed or next to ours, new NPU source commits, config drift (tools/bump-report.sh)"
+description = "Markdown report on the last check: Armbian patches failed or next to ours, new vendor source commits, config drift (tools/bump-report.sh)"
 run = "{{vars.docker}} {{vars.builder}} tools/bump-report.sh /work/check-build"
 
 [tasks.kunit]

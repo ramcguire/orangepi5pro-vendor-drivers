@@ -6,8 +6,8 @@
 # 1. Armbian patches that didn't apply, and whether each is already in the kernel (it
 #    reverse-applies there): then the kernel ran ahead of Armbian's tag.
 # 2. Armbian patches that touch files ours touch.
-# 3. New commits in the NPU driver's sources since the pins in our rknpu patches' Origin:
-#    lines. (The MPP/RGA patches cite a branch of the whole vendor kernel: not followed.)
+# 3. New commits in the vendor sources since the pins in our patches' Origin: lines, limited
+#    to the files we import where the source has them.
 # 4. The kernel config's MPP/RGA/NPU, IOMMU, devfreq and lockup-detector symbols against
 #    tools/config-baseline.txt; --update rewrites that file from build/.config.
 #
@@ -131,13 +131,29 @@ else
 	echo
 fi
 
-echo "### 3. NPU driver sources since our pins"
+echo "### 3. Vendor sources since our pins"
 echo
-grep -hoE '^Origin: https://github\.com/[^ ]+ [0-9a-f]{7,40}' "$here/userpatches/kernel/archive/$dir"/*-rknpu-*.patch |
-	LC_ALL=C sort -u > "$tmp/origins" || true
-while read -r _ url pin; do
-	repo=$tmp/repo-$(basename "$url")
-	if ! git clone -q --bare --filter=tree:0 "$url" "$repo" 2> "$tmp/clone.log"; then
+# Origin: <url> <pin> [(<branch>)], and the files each patch adds or changes.
+for f in "$here/userpatches/kernel/archive/$dir"/*.patch; do
+	origin=$(grep -m1 -oE '^Origin: https://github\.com/[^ ]+ [0-9a-f]{7,40}( \([^)]+\))?' "$f") || continue
+	sed -n 's|^+++ b/||p' "$f" | sed "s|^|${origin#Origin: }\t|"
+done | LC_ALL=C sort -u > "$tmp/origins"
+cut -f1 "$tmp/origins" | LC_ALL=C sort -u | while read -r url pin branch; do
+	branch=${branch#(}
+	branch=${branch%)}
+	name=${url#https://github.com/}
+	repo=$tmp/repo-${name//\//-}
+	if [[ -n $branch ]]; then
+		# A whole kernel: commits and trees from before the pin only. Commit dates there are out
+		# of order, so from 90 days before its author date.
+		since=$(curl -fsSL --retry 3 "https://api.github.com/repos/$name/commits/$pin" |
+			grep -oE '"date": *"[^"]+"' | sed -n '1s/.*"\([^"]*\)"$/\1/p') || true
+		[[ -n $since ]] || { echo "- $url: no date for \`$pin\`"; continue; }
+		args=(--filter=blob:none --single-branch --branch "$branch" --shallow-since="$(date -ud "@$(($(date -ud "$since" +%s) - 90 * 86400))" +%F)")
+	else
+		args=(--filter=tree:0)
+	fi
+	if ! git clone -q --bare "${args[@]}" "$url" "$repo" 2> "$tmp/clone.log"; then
 		echo "- $url: clone failed: $(tail -n1 "$tmp/clone.log")"
 		continue
 	fi
@@ -146,11 +162,19 @@ while read -r _ url pin; do
 		echo "- $url: pin \`$pin\` not found (head \`$head\`)"
 		continue
 	fi
-	count=$(git -C "$repo" rev-list --count "$pin..HEAD")
-	echo "- [${url#https://github.com/}]($url): $count new since \`$pin\` (head \`$head\`)"
-	git -C "$repo" log --format="  - [\`%h\`]($url/commit/%H) %as %s" "$pin..HEAD"
-done < "$tmp/origins"
-[[ -s $tmp/origins ]] || echo "No Origin: lines in our rknpu patches."
+	# Our files at the source's paths (the vendor kernel keeps them in drivers/video/rockchip/).
+	mapfile -t paths < <(awk -F'\t' -v o="$url $pin${branch:+ ($branch)}" '$1 == o { print $2 }' "$tmp/origins" |
+		sed -e 's|^drivers/media/platform/rockchip/rga/rga3/|drivers/video/rockchip/rga3/|' \
+			-e 's|^drivers/media/platform/rockchip/mpp/|drivers/video/rockchip/mpp/|' |
+		grep -vE '(^|/)(Kconfig|Makefile|Kbuild)$' |
+		xargs -r git -C "$repo" ls-tree -r --name-only "$pin" -- || true)
+	count=$(git -C "$repo" rev-list --count "$pin..HEAD" -- "${paths[@]}")
+	scope="all files"
+	[[ ${#paths[@]} -eq 0 ]] || scope="${#paths[@]} of our files"
+	echo "- [$name]($url)${branch:+ \`$branch\`}: $count new since \`$pin\` in $scope (head \`$head\`)"
+	git -C "$repo" log --format="  - [\`%h\`]($url/commit/%H) %as %s" "$pin..HEAD" -- "${paths[@]}"
+done
+[[ -s $tmp/origins ]] || echo "No Origin: lines in our patches."
 echo
 echo "Mark each new commit applied or not applicable on the pull request."
 echo
