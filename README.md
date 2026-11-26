@@ -130,7 +130,7 @@ With them, Ethernet came up on 14 of 14 boots, against 15 of 32 without. Armbian
 - Fixed-clock codecs: the decoder runs at 786/594 MHz.
 - No 10-bit hardware encode. HDR goes to 8-bit through RGA, still tagged BT.2020/PQ.
 - RGA2 is untested: no workload has reached it.
-- Keep suspend off: an earlier build hung on resume.
+- Keep suspend off: on stock Armbian 6.18 the board hangs on resume, with or without these drivers, and the power button doesn't wake it. The drivers' system-sleep paths are untested.
 - An NPU client that keeps timing out can freeze the board (librknnrt 2.3.0). Use 2.3.2.
 - Don't write `on` to `/sys/devices/platform/fdab9000.iommu/power/control` while the NPU is off: the IOMMU would touch unpowered NPU cores.
 
