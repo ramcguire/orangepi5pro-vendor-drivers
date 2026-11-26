@@ -19,6 +19,9 @@ shellcheck = "0.11.0"
 builder = "ghcr.io/armbian/docker-armbian-build:armbian-debian-trixie-latest@sha256:c51c8f2a7f388dd4da513b1625c1ae18b58850ea88538eb447edbcf2a65e84ff"
 # renovate: datasource=docker depName=ghcr.io/renovatebot/renovate
 renovate = "ghcr.io/renovatebot/renovate:44.252.7@sha256:da2082c34a7e8aee0fbf50122d71a052ba32ea5f51aeded502b742ad7bc9d5a2"
+# For dkms-check (arm64).
+# renovate: datasource=docker depName=debian
+debian = "debian:trixie@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6"
 # /opi5/armbian, not /armbian: the image has files there, which Docker would copy into
 # the empty volume.
 # CCACHE_DIR: unset otherwise when compile.sh runs directly, so ccache would write inside
@@ -50,6 +53,14 @@ run = "{{vars.docker}} {{vars.builder}} ./build.sh ENABLE_EXTENSIONS=ccache"
 [tasks.modules]
 description = "Build only rk_vcodec.ko, rga3.ko, rknpu.ko, their KUnit tests and the board DTB into out/drivers/"
 run = "{{vars.docker}} {{vars.builder}} tools/modules.sh /work/kernel /work/build"
+
+[tasks.dkms-src]
+description = "DKMS sources of the three drivers into out/dkms/"
+run = "{{vars.docker}} --env \"GIT_DESCRIBE={{exec(command='git describe --tags --match v* --dirty')}}\" {{vars.builder}} tools/dkms-src.sh /work/kernel"
+
+[tasks.dkms-check]
+description = "Build the DKMS sources against Armbian's headers packages; arguments are package[=version]"
+run = "docker run --rm --platform linux/arm64 --entrypoint bash --workdir /src --mount \"type=bind,source={{config_root}},target=/src\" --env OUT_DIR=/src/out {{vars.debian}} tools/dkms-check.sh"
 
 [tasks.check]
 description = "Apply all patches with Armbian's patcher (tools/patch.sh), then compile the drivers and DTB from that tree"

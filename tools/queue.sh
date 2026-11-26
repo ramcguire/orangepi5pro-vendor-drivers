@@ -4,6 +4,7 @@
 #   tools/queue.sh import [dir]  # Armbian's patched kernel up to ours (tag opi5-base), then ours;
 #                                # replaces a queue only if it's all in userpatches/
 #   tools/queue.sh export [dir]  # opi5-base.. back into userpatches/
+#   tools/queue.sh check [dir]   # fails unless the queue matches userpatches/
 #
 # dir defaults to work/kernel. Export maps commits to files by position, so the counts must
 # match: to add a patch, put it in userpatches/ as zz-opi5-<n>-<name>.patch and re-import.
@@ -108,5 +109,11 @@ export_() {
 case ${1:-} in
 import) import ;;
 export) export_ ;;
-*) sed -n '2,9p' "$0" >&2; exit 2 ;;
+check)
+	in_userpatches || {
+		echo "queue.sh: $tree differs from userpatches/" >&2
+		exit 1
+	}
+	;;
+*) sed -n '2,10p' "$0" >&2; exit 2 ;;
 esac

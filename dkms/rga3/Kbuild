@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-2.0
+# Kconfig values for the out-of-tree build: make variables and -D flags.
+CONFIG_ROCKCHIP_MULTI_RGA := m
+CONFIG_ROCKCHIP_RGA_ASYNC := y
+CONFIG_ROCKCHIP_RGA_DEBUG_FS := y
+CONFIG_ROCKCHIP_RGA_DEBUGGER := y
+
+ccflags-y += -DCONFIG_ROCKCHIP_MULTI_RGA_MODULE=1
+ccflags-y += -DCONFIG_ROCKCHIP_RGA_ASYNC=1
+ccflags-y += -DCONFIG_ROCKCHIP_RGA_DEBUG_FS=1
+ccflags-y += -DCONFIG_ROCKCHIP_RGA_DEBUGGER=1
+
+include $(src)/Makefile
