@@ -57,7 +57,7 @@ To undo it, write the saved one back with `dd if=/root/bootarea.img of="$dev" bs
 **Bumps** follow Armbian's tags. Renovate moves the Armbian tag, the 6.18.y kernel tag and the builder image together in one pull request on Tuesdays, and we don't patch ahead of Armbian. Everything else (Actions, tools) comes grouped in one pull request, which doesn't release. On those pull requests, `check.yml` adds `tools/bump-report.sh`'s report:
 - Armbian patches that failed;
 - Armbian patches that overlap ours;
-- new NPU source commits, to mark applied or not applicable;
+- new commits in the vendor sources (Rockchip's kernel, the NPU repositories) to the files we import, to mark applied or not applicable;
 - config drift. Explain it, then `mise run bump-report -- --update`.
 
 ## Patches
