@@ -75,6 +75,7 @@ The thousands digit is the purpose.
 | `2020` | The Kconfig/Makefile hooks, the only lines in files mainline or Armbian own |
 | **3xxx: fixes from the board** | |
 | `3010` | RKVDEC2 CCU timeout at 4K: 106.7 → 120 ms |
+| `3020` | MPP: defer a core's probe until its CCU and core 0 are bound; as modules they probed in any order |
 | **4xxx: hardening (ours)** | Hardening below |
 | `4010` | MPP: bound user requests |
 | `4020` | RGA: own requests and buffers |
@@ -89,7 +90,7 @@ The thousands digit is the purpose.
 | `6020` | `rga_kunit`: the request filter, one base address per buffer (2010). `rga3.ko` won't load without RGA cores, so the checks are header inlines the test includes |
 
 **Device tree.** `dt/rk3588s-orangepi-5-pro.dts` is Armbian's file plus two `#include`s, and `check` fails if it drifts from Armbian's.
-- `-mpp.dtsi`: the codec and RGA3 cores, their CCUs and IOMMUs. It points `&rga` at the vendor RGA2 driver and disables the V4L2 decoders. Keep the node order: the RGA3 scheduler bits follow probe order.
+- `-mpp.dtsi`: the codec and RGA3 cores, their CCUs and IOMMUs. It points `&rga` at the vendor RGA2 driver and disables the V4L2 decoders. Its aliases number the codec cores. Keep the node order: the RGA3 scheduler bits follow probe order.
 - `-npu.dtsi`: mack42's vendor NPU node in place of mainline's rocket nodes, with one IOMMU domain for all three cores.
 
 **Kernel config.** `extensions/opi5.sh` builds the drivers and tests as modules. It turns off the V4L2 decoder and rocket (they bind the same hardware), and turns on the lockup and hung-task detectors, warn-only. The build fails if an option is missing from the final `.config`.

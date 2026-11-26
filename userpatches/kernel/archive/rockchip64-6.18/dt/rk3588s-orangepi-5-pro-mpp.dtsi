@@ -4,6 +4,14 @@
  */
 
 / {
+	/* Codec core numbers (3020). */
+	aliases {
+		rkvdec0 = &rkvdec0;
+		rkvdec1 = &rkvdec1;
+		rkvenc0 = &rkvenc0;
+		rkvenc1 = &rkvenc1;
+	};
+
 	/*
 	 * The rkmpp-codec profile owns these cores through Rockchip's request
 	 * ABI.  Keep this binding here, rather than changing rk3588-base.dtsi:
