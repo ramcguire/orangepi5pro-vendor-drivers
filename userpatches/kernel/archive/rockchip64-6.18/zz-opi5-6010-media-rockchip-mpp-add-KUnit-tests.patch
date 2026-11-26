@@ -59,7 +59,7 @@ index 3daf18d1399d..a900466b899c 100644
  obj-$(CONFIG_ROCKCHIP_MPP_SERVICE) += rk_vcodec.o
 +obj-$(CONFIG_ROCKCHIP_MPP_KUNIT_TEST) += mpp_kunit.o
 diff --git a/drivers/media/platform/rockchip/mpp/mpp_common.c b/drivers/media/platform/rockchip/mpp/mpp_common.c
-index e2c0da6e5de1..16f17701a0fa 100644
+index f04c61a2a63a..9bc5df87078a 100644
 --- a/drivers/media/platform/rockchip/mpp/mpp_common.c
 +++ b/drivers/media/platform/rockchip/mpp/mpp_common.c
 @@ -30,6 +30,7 @@
@@ -351,7 +351,7 @@ index 000000000000..325299419eb8
 +MODULE_DESCRIPTION("KUnit tests for the Rockchip MPP service");
 +MODULE_LICENSE("GPL");
 diff --git a/drivers/media/platform/rockchip/mpp/mpp_rkvdec2_link.c b/drivers/media/platform/rockchip/mpp/mpp_rkvdec2_link.c
-index 9175cae77fe4..ee69e5c558ba 100644
+index 92172ea0326c..4a82f3c772f0 100644
 --- a/drivers/media/platform/rockchip/mpp/mpp_rkvdec2_link.c
 +++ b/drivers/media/platform/rockchip/mpp/mpp_rkvdec2_link.c
 @@ -10,6 +10,7 @@
