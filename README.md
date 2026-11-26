@@ -36,7 +36,7 @@ reboot
 
 To undo it, write the saved one back with `dd if=/root/bootarea.img of="$dev" bs=32k skip=1 seek=1 count=511 conv=notrunc`. For U-Boot in SPI flash, use `armbian-install` instead.
 
-**Userspace.** For the codecs and RGA, use FFmpeg built with rkmpp and librga. NPU clients need `/dev/rknpu`, `/dev/dma_heap` and `librknnrt` 2.3.2; 2.3.0 times out every job on this driver.
+**Userspace.** For the codecs and RGA, use FFmpeg built with rkmpp and librga. NPU clients need `/dev/rknpu`, `/dev/dma_heap` and `librknnrt` 2.3.2; 2.3.0 times out every job on this driver. Each release's `60-rockchip-vendor.rules`, in `/etc/udev/rules.d/`, opens MPP and RGA to `video`, and the NPU and DMA heaps to `render`.
 
 **Build with Armbian.** Copy `userpatches/` (or a release's `opi5-userpatches-*.tar.gz`) into [armbian/build](https://github.com/armbian/build) at the tag `build.sh` pins, then run `./compile.sh opi5 kernel` (and `./compile.sh opi5 uboot`). To add the drivers to another build, copy `kernel/archive/rockchip64-6.18/` and `extensions/opi5.sh` and set `ENABLE_EXTENSIONS=opi5`.
 
@@ -117,7 +117,7 @@ With them, Ethernet came up on 14 of 14 boots, against 15 of 32 without. Armbian
 
 ## Hardening
 
-`4010`, `4020` and `5050` are ours, written from reading the vendor code. The devices are root-only on the host, but containers that use them get them, and without these patches a buggy or compromised process there could corrupt kernel memory. They passed the abuse tests (`tests/`, each file's header says how to run it) and every bench stage. If other userspace hits a check, the kernel log names it.
+`4010`, `4020` and `5050` are ours, written from reading the vendor code. Without them, any process with the devices (`video` and `render` with the udev rule, or a container) could corrupt kernel memory. They passed the abuse tests (`tests/`, each file's header says how to run it) and every bench stage. If other userspace hits a check, the kernel log names it.
 
 - **`4010`, MPP:** bounds checks done in `int` (a 2 GB offset passed), unchecked register-table and RCB indices, rkvenc2 array overruns, any fd accepted as a session.
 - **`4020`, RGA:** physical addresses mapped as given, a kernel pointer taken from userspace, and global request ids and buffer handles: one client could cancel or free another's.
