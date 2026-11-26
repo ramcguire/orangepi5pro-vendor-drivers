@@ -49,6 +49,7 @@ To undo it, write the saved one back with `dd if=/root/bootarea.img of="$dev" bs
 - `tests`: the abuse tests (Hardening), as static arm64 binaries.
 - `queue-import`, `queue-export`, `shell`: edit the patches as git commits (`tools/queue.sh`). Rewrite them in `mise run shell`, then export.
 - `dkms-src`, `dkms-check`: experimental, the drivers as DKMS on Armbian's own kernel. `dkms-src` writes the sources to `out/dkms/`, versioned from the release tag. `dkms-check` builds them against Armbian's headers packages (`package[=version]`, default the newest `linux-headers-current-rockchip64`).
+- `overlays`: `dt/` as overlays for Armbian's DTB, into `out/overlays/`. Fails unless they reproduce our DTB, node order included.
 - `lint`, `renovate-check`, `clean`.
 
 **CI.** `check.yml` runs `check` on every push and every third day, which also keeps the caches from expiring. It skips Armbian's patching while the patches and Armbian are unchanged. Commits follow [Conventional Commits](https://www.conventionalcommits.org): hk checks them locally, and `pr-title.yml` checks pull request titles, as pull requests are squash-merged. On `main`, `release.yml` releases when `userpatches/`, `build.sh` or the builder image changed: `build.yml` builds and runs `kunit`, then tags `v<kernel>-<n>` and publishes the release, with notes from the commits (`cliff.toml`). A tag pushed by hand releases too.

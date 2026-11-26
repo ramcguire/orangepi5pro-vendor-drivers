@@ -58,6 +58,10 @@ run = "{{vars.docker}} {{vars.builder}} tools/modules.sh /work/kernel /work/buil
 description = "DKMS sources of the three drivers into out/dkms/"
 run = "{{vars.docker}} --env \"GIT_DESCRIBE={{exec(command='git describe --tags --match v* --dirty')}}\" {{vars.builder}} tools/dkms-src.sh /work/kernel"
 
+[tasks.overlays]
+description = "Overlays into out/overlays/, checked against our DTB; arguments are stock DTBs to apply them to"
+run = "{{vars.docker}} {{vars.builder}} tools/overlays.sh /work/kernel"
+
 [tasks.dkms-check]
 description = "Build the DKMS sources against Armbian's headers packages; arguments are package[=version]"
 run = "docker run --rm --platform linux/arm64 --entrypoint bash --workdir /src --mount \"type=bind,source={{config_root}},target=/src\" --env OUT_DIR=/src/out {{vars.debian}} tools/dkms-check.sh"
