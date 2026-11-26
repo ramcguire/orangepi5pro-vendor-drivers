@@ -93,6 +93,7 @@ The thousands digit is the purpose.
 | `5070` | Defer rate changes while the NPU is off |
 | `5080` | Release the NPU domains and clocks once the IOMMU has suspended |
 | `5090` | Park the NPU clock at 200 MHz (GPLL) before power-off; the PVT-PLL loses its setup and the next power-on hangs. 5060-5080 need it |
+| `5100` | debugfs read-only: writes bypassed power and rate management |
 | **6xxx: KUnit tests (ours)** | Modules only. Loading one runs it and taints the kernel |
 | `6010` | `mpp_kunit`: the ABI (1010), command filter, request bounds (4010), CCU timeout (3010). With `CONFIG_KUNIT`, the functions under test are exported in `EXPORTED_FOR_KUNIT_TESTING` |
 | `6020` | `rga_kunit`: the request filter, one base address per buffer (2010). `rga3.ko` won't load without RGA cores, so the checks are header inlines the test includes |
