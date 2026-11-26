@@ -1,0 +1,133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: opi5 <noreply@example.invalid>
+Date: Thu, 26 Nov 2026 17:29:09 +0000
+Subject: [PATCH] media: rockchip: mpp: make procfs read-only
+
+Writes changed clocks and scheduling state behind the driver.
+---
+ .../media/platform/rockchip/mpp/mpp_common.c   | 18 ++----------------
+ .../media/platform/rockchip/mpp/mpp_rkvdec2.c  | 12 ++++++------
+ .../platform/rockchip/mpp/mpp_rkvdec2_link.c   |  2 +-
+ .../media/platform/rockchip/mpp/mpp_rkvenc2.c  |  6 +++---
+ .../media/platform/rockchip/mpp/mpp_service.c  |  4 ++--
+ 5 files changed, 14 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/mpp/mpp_common.c b/drivers/media/platform/rockchip/mpp/mpp_common.c
+index e2c0da6e5de1..f04c61a2a63a 100644
+--- a/drivers/media/platform/rockchip/mpp/mpp_common.c
++++ b/drivers/media/platform/rockchip/mpp/mpp_common.c
+@@ -2725,24 +2725,10 @@ static int fops_open_u32(struct inode *inode, struct file *file)
+ 	return single_open(file, fops_show_u32, pde_data(inode));
+ }
+ 
+-static ssize_t fops_write_u32(struct file *file, const char __user *buf,
+-			      size_t count, loff_t *ppos)
+-{
+-	int rc;
+-	struct seq_file *priv = file->private_data;
+-
+-	rc = kstrtou32_from_user(buf, count, 0, priv->private);
+-	if (rc)
+-		return rc;
+-
+-	return count;
+-}
+-
+ static const struct proc_ops procfs_fops_u32 = {
+ 	.proc_open = fops_open_u32,
+ 	.proc_read = seq_read,
+ 	.proc_release = single_release,
+-	.proc_write = fops_write_u32,
+ };
+ 
+ struct proc_dir_entry *
+@@ -2754,7 +2740,7 @@ mpp_procfs_create_u32(const char *name, umode_t mode,
+ 
+ void mpp_procfs_create_common(struct proc_dir_entry *parent, struct mpp_dev *mpp)
+ {
+-	mpp_procfs_create_u32("disable_work", 0644, parent, &mpp->disable);
+-	mpp_procfs_create_u32("timing_check", 0644, parent, &mpp->timing_check);
++	mpp_procfs_create_u32("disable_work", 0444, parent, &mpp->disable);
++	mpp_procfs_create_u32("timing_check", 0444, parent, &mpp->timing_check);
+ }
+ #endif
+diff --git a/drivers/media/platform/rockchip/mpp/mpp_rkvdec2.c b/drivers/media/platform/rockchip/mpp/mpp_rkvdec2.c
+index 986b13c2f0a6..c4fba02fed3d 100644
+--- a/drivers/media/platform/rockchip/mpp/mpp_rkvdec2.c
++++ b/drivers/media/platform/rockchip/mpp/mpp_rkvdec2.c
+@@ -952,19 +952,19 @@ static int rkvdec2_procfs_init(struct mpp_dev *mpp)
+ 	/* for common mpp_dev options */
+ 	mpp_procfs_create_common(dec->procfs, mpp);
+ 
+-	mpp_procfs_create_u32("aclk", 0644,
++	mpp_procfs_create_u32("aclk", 0444,
+ 			      dec->procfs, &dec->aclk_info.debug_rate_hz);
+-	mpp_procfs_create_u32("clk_core", 0644,
++	mpp_procfs_create_u32("clk_core", 0444,
+ 			      dec->procfs, &dec->core_clk_info.debug_rate_hz);
+-	mpp_procfs_create_u32("clk_cabac", 0644,
++	mpp_procfs_create_u32("clk_cabac", 0444,
+ 			      dec->procfs, &dec->cabac_clk_info.debug_rate_hz);
+-	mpp_procfs_create_u32("clk_hevc_cabac", 0644,
++	mpp_procfs_create_u32("clk_hevc_cabac", 0444,
+ 			      dec->procfs, &dec->hevc_cabac_clk_info.debug_rate_hz);
+-	mpp_procfs_create_u32("session_buffers", 0644,
++	mpp_procfs_create_u32("session_buffers", 0444,
+ 			      dec->procfs, &mpp->session_max_buffers);
+ 	proc_create_single("perf_sel_offset", 0444,
+ 			   dec->procfs, rkvdec2_show_pref_sel_offset);
+-	mpp_procfs_create_u32("task_count", 0644,
++	mpp_procfs_create_u32("task_count", 0444,
+ 			      dec->procfs, &mpp->task_index);
+ 
+ 	return 0;
+diff --git a/drivers/media/platform/rockchip/mpp/mpp_rkvdec2_link.c b/drivers/media/platform/rockchip/mpp/mpp_rkvdec2_link.c
+index 9175cae77fe4..92172ea0326c 100644
+--- a/drivers/media/platform/rockchip/mpp/mpp_rkvdec2_link.c
++++ b/drivers/media/platform/rockchip/mpp/mpp_rkvdec2_link.c
+@@ -789,7 +789,7 @@ int rkvdec2_link_procfs_init(struct mpp_dev *mpp)
+ 	link_dec->statistic_count = 0;
+ 
+ 	if (dec->procfs)
+-		mpp_procfs_create_u32("statistic_count", 0644,
++		mpp_procfs_create_u32("statistic_count", 0444,
+ 				      dec->procfs, &link_dec->statistic_count);
+ 
+ 	return 0;
+diff --git a/drivers/media/platform/rockchip/mpp/mpp_rkvenc2.c b/drivers/media/platform/rockchip/mpp/mpp_rkvenc2.c
+index b6395eaa44b6..4e8742aa656b 100644
+--- a/drivers/media/platform/rockchip/mpp/mpp_rkvenc2.c
++++ b/drivers/media/platform/rockchip/mpp/mpp_rkvenc2.c
+@@ -2113,11 +2113,11 @@ static int rkvenc_procfs_init(struct mpp_dev *mpp)
+ 	mpp_procfs_create_common(enc->procfs, mpp);
+ 
+ 	/* for debug */
+-	mpp_procfs_create_u32("aclk", 0644,
++	mpp_procfs_create_u32("aclk", 0444,
+ 			      enc->procfs, &enc->aclk_info.debug_rate_hz);
+-	mpp_procfs_create_u32("clk_core", 0644,
++	mpp_procfs_create_u32("clk_core", 0444,
+ 			      enc->procfs, &enc->core_clk_info.debug_rate_hz);
+-	mpp_procfs_create_u32("session_buffers", 0644,
++	mpp_procfs_create_u32("session_buffers", 0444,
+ 			      enc->procfs, &mpp->session_max_buffers);
+ 	/* for show session info */
+ 	proc_create_single_data("sessions-info", 0444,
+diff --git a/drivers/media/platform/rockchip/mpp/mpp_service.c b/drivers/media/platform/rockchip/mpp/mpp_service.c
+index 6f8f71b05a8e..b199389783b0 100644
+--- a/drivers/media/platform/rockchip/mpp/mpp_service.c
++++ b/drivers/media/platform/rockchip/mpp/mpp_service.c
+@@ -375,11 +375,11 @@ static int mpp_procfs_init(struct mpp_service *srv)
+ 	proc_create_single_data("supports-device", 0444,
+ 				srv->procfs, mpp_show_support_device, srv);
+ 	srv->timing_en = 1;
+-	mpp_procfs_create_u32("timing_en", 0644, srv->procfs, &srv->timing_en);
++	mpp_procfs_create_u32("timing_en", 0444, srv->procfs, &srv->timing_en);
+ 	/* show per device load info */
+ 	proc_create_single_data("load", 0444, srv->procfs, mpp_show_device_load, srv);
+ 	srv->load_interval = 0;
+-	mpp_procfs_create_u32("load_interval", 0644, srv->procfs, &srv->load_interval);
++	mpp_procfs_create_u32("load_interval", 0444, srv->procfs, &srv->load_interval);
+ 
+ 	return 0;
+ }

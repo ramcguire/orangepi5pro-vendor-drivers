@@ -82,6 +82,7 @@ The thousands digit is the purpose.
 | **4xxx: hardening (ours)** | Hardening below |
 | `4010` | MPP: bound user requests |
 | `4020` | RGA: own requests and buffers |
+| `4030` | MPP: procfs read-only |
 | **5xxx: NPU** (`rknpu.ko`) | |
 | `5010` | [w568w/rknpu-module](https://github.com/w568w/rknpu-module) at `a8792fe6b633`, unchanged |
 | `5020` | [mack42/OrangePi5Pro](https://github.com/mack42/OrangePi5Pro)'s mainline port at `6798f7e8af4e`: memory ioctls, devfreq, multi-core, `/dev/rknpu` |
