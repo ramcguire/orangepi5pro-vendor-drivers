@@ -5,3 +5,6 @@ DEST_MODULE_LOCATION[0]="/updates/dkms"
 BUILD_EXCLUSIVE_ARCH="^aarch64$"
 BUILD_EXCLUSIVE_KERNEL="-rockchip64$"
 AUTOINSTALL="yes"
+# dpkg can configure linux-image before linux-headers, whose postinst compiles scripts/:
+# skip until then, rather than fail the image. The headers' postinst runs DKMS again.
+[ -x "/lib/modules/$kernelver/build/scripts/mod/modpost" ] || BUILD_EXCLUSIVE_KERNEL='^$'
