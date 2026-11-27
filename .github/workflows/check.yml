@@ -92,14 +92,19 @@ jobs:
           KEY: ${{ steps.cache.outputs.cache-primary-key }}
         run: tools/cache-prune.sh check- "$KEY"
 
-  # The package against Armbian's newest headers and DTB on apt. Edge only warns.
+  # The package against Armbian's newest headers and DTB: on apt, and on beta, where they
+  # land before apt. Edge, and beta outside the schedule, only warn.
   dkms:
     runs-on: ubuntu-24.04-arm
-    continue-on-error: ${{ matrix.branch == 'edge' }}
+    continue-on-error: ${{ matrix.branch == 'edge' || (matrix.repo == 'beta' && github.event_name != 'schedule') }}
     strategy:
       fail-fast: false
       matrix:
         branch: [current, edge]
+        repo: [apt]
+        include:
+          - branch: current
+            repo: beta
     env:
       MISE_TASK_RUN_AUTO_INSTALL: "false"
     steps:
@@ -110,12 +115,14 @@ jobs:
           install: false
 
       - name: Build
+        env:
+          ARMBIAN_APT: https://${{ matrix.repo }}.armbian.com
         run: mise run dkms-check -- "linux-headers-${{ matrix.branch }}-rockchip64"
 
       - if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: dkms-check-${{ matrix.branch }}
+          name: dkms-check-${{ matrix.repo }}-${{ matrix.branch }}
           path: out/dkms-check/*/
 
   # A scheduled failure opens one issue (or comments on it); the next pass closes it.
@@ -136,7 +143,7 @@ jobs:
           issue=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number,title \
             --jq ".[] | select(.title == env.TITLE) | .number" | head -1)
           if [[ $FAILED == true ]]; then
-            body="$RUN failed against Armbian's newest packages. Hold the kernel (\`apt-mark hold linux-image-current-rockchip64 linux-dtb-current-rockchip64 linux-headers-current-rockchip64\`) until it passes."
+            body="$RUN failed against Armbian's newest packages. If a dkms job on apt failed, hold the kernel (\`apt-mark hold linux-image-current-rockchip64 linux-dtb-current-rockchip64 linux-headers-current-rockchip64\`) until it passes. If only beta's failed, fix the drivers before that kernel reaches apt."
             if [[ -n $issue ]]; then
               gh issue comment "$issue" --body "$RUN failed again."
             else
