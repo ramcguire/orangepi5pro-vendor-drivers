@@ -7,4 +7,5 @@ Maintainer: orangepi5pro-vendor-drivers
 Depends: dkms, linux-headers-current-rockchip64 | linux-headers-edge-rockchip64
 Description: Rockchip's MPP, RGA3 and NPU drivers for the Orange Pi 5 Pro
  For Armbian's own kernel: the drivers as DKMS modules, device tree overlays for
- Armbian's DTB, and a udev rule for the video and render groups.
+ Armbian's DTB, a udev rule for the video and render groups, and a blacklist
+ for mainline's decoder and NPU drivers.

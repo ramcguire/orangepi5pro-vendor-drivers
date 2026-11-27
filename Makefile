@@ -1,6 +1,6 @@
 # The drivers as DKMS modules for Armbian's own kernel (current or edge, rockchip64), with
-# the overlays and udev rule, as a package. On the board, with git, dkms, device-tree-compiler
-# and the headers:
+# the overlays, udev rule and blacklist, as a package. On the board, with git, dkms,
+# device-tree-compiler and the headers:
 #
 #   sudo make install     # builds the package and installs it; reboot after, for the overlays
 #   sudo make uninstall
@@ -39,6 +39,7 @@ deb: src $(dtbos)
 		sed -e 's/@PACKAGE@/$(p)/' -e 's/@MODULE@/$(subst -,_,$(p))/' -e 's/@VERSION@/$(VERSION)/' \
 			dkms/dkms.conf.in > $(root)/usr/src/$(p)-$(VERSION)/dkms.conf &&) true
 	install -D -m 644 udev/60-rockchip-vendor.rules $(root)/usr/lib/udev/rules.d/60-rockchip-vendor.rules
+	install -D -m 644 dkms/modprobe.conf $(root)/usr/lib/modprobe.d/$(NAME).conf
 	install -d $(root)/boot/overlay-user $(root)/DEBIAN
 	install -m 644 $(dtbos) $(root)/boot/overlay-user/
 	$(foreach f,control postinst prerm,\
