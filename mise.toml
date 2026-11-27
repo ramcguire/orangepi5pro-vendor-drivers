@@ -64,7 +64,7 @@ run = "{{vars.docker}} {{vars.builder}} tools/overlays.sh /work/kernel"
 
 [tasks.dkms-check]
 description = "Install the drivers-only package against Armbian's headers and DTB packages; arguments are package[=version]"
-run = "docker run --rm --platform linux/arm64 --entrypoint bash --workdir /src --mount \"type=bind,source={{config_root}},target=/src\" --env OUT_DIR=/src/out {{vars.debian}} tools/dkms-check.sh"
+run = "docker run --rm --platform linux/arm64 --entrypoint bash --workdir /src --mount \"type=bind,source={{config_root}},target=/src\" --env OUT_DIR=/src/out --env ARMBIAN_APT {{vars.debian}} tools/dkms-check.sh"
 
 [tasks.check]
 description = "Apply all patches with Armbian's patcher (tools/patch.sh), compile the drivers and DTB from that tree, and check the DKMS sources and overlays/ against it"
