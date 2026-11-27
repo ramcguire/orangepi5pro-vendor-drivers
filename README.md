@@ -21,7 +21,7 @@ sudo make install
 reboot
 ```
 
-`make install` builds the package and installs it; or `apt install` a release's `orangepi5pro-vendor-drivers_*.deb`. DKMS builds the three modules, and rebuilds them with each kernel update's headers. Overlays (`user_overlays` in `armbianEnv.txt`) add the device tree nodes, and the udev rule opens the devices. `sudo make uninstall` or `apt remove` undoes it. A failed rebuild doesn't stop a kernel update, which then boots without the drivers; CI's scheduled check opens an issue first, so hold the kernel then. Not for the kernel packages below, which have the drivers.
+`make install` builds the package and installs it; or `apt install` a release's `orangepi5pro-vendor-drivers_*.deb`. DKMS builds the three modules, and rebuilds them with each kernel update's headers. Overlays (`user_overlays` in `armbianEnv.txt`) add the device tree nodes and disable mainline's decoder and NPU nodes, a `modprobe.d` blacklist keeps their drivers (`rockchip_vdec`, `rocket`) from loading, and the udev rule opens the devices. `sudo make uninstall` or `apt remove` undoes it. A failed rebuild doesn't stop a kernel update, which then boots without the drivers; CI's scheduled check opens an issue first, so hold the kernel then. Not for the kernel packages below, which have the drivers.
 
 **Packages.** Each [release](../../releases) has the `linux-image`, `linux-dtb` and `linux-headers` packages. On an Armbian `current` install for the Orange Pi 5 Pro:
 
