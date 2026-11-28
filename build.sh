@@ -10,8 +10,8 @@ set -euo pipefail
 # shellcheck disable=SC2034 # Read by tools/armbian.sh.
 ARMBIAN_URL=https://github.com/armbian/build
 # renovate: datasource=github-tags depName=armbian/build
-ARMBIAN_TAG=v26.11.0-trunk.133
-ARMBIAN_COMMIT=910bf7b2ea91c86b95b8673fc655d22d285d446c
+ARMBIAN_TAG=v26.11.0-trunk.140
+ARMBIAN_COMMIT=fccff8066590a64dcbad9d8938abf8280b15d941
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 armbian=${ARMBIAN_DIR:-$here/work/armbian}

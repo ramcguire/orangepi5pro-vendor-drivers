@@ -16,7 +16,7 @@ shellcheck = "0.11.0"
 
 [vars]
 # renovate: datasource=docker depName=ghcr.io/armbian/docker-armbian-build
-builder = "ghcr.io/armbian/docker-armbian-build:armbian-debian-trixie-latest@sha256:c51c8f2a7f388dd4da513b1625c1ae18b58850ea88538eb447edbcf2a65e84ff"
+builder = "ghcr.io/armbian/docker-armbian-build:armbian-debian-trixie-latest@sha256:c9a58a2e4b82fbbccd7a2406202b423514e20dedcf66ab64930bbc7fc4a7861b"
 # renovate: datasource=docker depName=ghcr.io/renovatebot/renovate
 renovate = "ghcr.io/renovatebot/renovate:45.3.2@sha256:d0358088501c7665688673c8932474b02517941703a16e970e8b4fcf235299cb"
 # For dkms-check (arm64).
