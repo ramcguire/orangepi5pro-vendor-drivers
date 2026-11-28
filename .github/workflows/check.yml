@@ -21,7 +21,7 @@ env:
 
 jobs:
   check:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       actions: write # Deletes superseded caches.
@@ -37,7 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
+      - uses: jdx/mise-action@924e7c586e33d7d4bae9c14e26c5d22e2beb6e78 # v5.3.0
 
       - name: Lint
         run: mise run lint
@@ -95,7 +95,7 @@ jobs:
   # The package against Armbian's newest headers and DTB: on apt, and on beta, where they
   # land before apt. Edge, and beta outside the schedule, only warn.
   dkms:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-26.04-arm
     continue-on-error: ${{ matrix.branch == 'edge' || (matrix.repo == 'beta' && github.event_name != 'schedule') }}
     strategy:
       fail-fast: false
@@ -110,7 +110,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: jdx/mise-action@f5be966e4a917d54244728e6a5fdcd1d93a35e6c # v5.2.6
+      - uses: jdx/mise-action@924e7c586e33d7d4bae9c14e26c5d22e2beb6e78 # v5.3.0
         with:
           install: false
 
@@ -129,7 +129,7 @@ jobs:
   report:
     needs: [check, dkms]
     if: always() && github.event_name == 'schedule'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       issues: write
     env:
@@ -156,7 +156,7 @@ jobs:
   # Restores build.yml's ccache, so it isn't evicted between weekly builds.
   keep-ccache:
     if: github.event_name == 'schedule'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
