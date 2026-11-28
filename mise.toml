@@ -11,17 +11,17 @@ editorconfig-checker = "4.0.2"
 # Release notes (cliff.toml).
 git-cliff = "2.14.2"
 # The same version as hk.pkl's package URLs.
-hk = "2.11.1"
+hk = "2.14.0"
 shellcheck = "0.11.0"
 
 [vars]
 # renovate: datasource=docker depName=ghcr.io/armbian/docker-armbian-build
 builder = "ghcr.io/armbian/docker-armbian-build:armbian-debian-trixie-latest@sha256:c51c8f2a7f388dd4da513b1625c1ae18b58850ea88538eb447edbcf2a65e84ff"
 # renovate: datasource=docker depName=ghcr.io/renovatebot/renovate
-renovate = "ghcr.io/renovatebot/renovate:44.252.7@sha256:da2082c34a7e8aee0fbf50122d71a052ba32ea5f51aeded502b742ad7bc9d5a2"
+renovate = "ghcr.io/renovatebot/renovate:45.3.2@sha256:d0358088501c7665688673c8932474b02517941703a16e970e8b4fcf235299cb"
 # For dkms-check (arm64).
 # renovate: datasource=docker depName=debian
-debian = "debian:trixie@sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6"
+debian = "debian:trixie@sha256:3cda3ca472ce45507a5109c6a3907093e24d9ae67d55954c9a07a45665dafba2"
 # /opi5/armbian, not /armbian: the image has files there, which Docker would copy into
 # the empty volume.
 # CCACHE_DIR: unset otherwise when compile.sh runs directly, so ccache would write inside
