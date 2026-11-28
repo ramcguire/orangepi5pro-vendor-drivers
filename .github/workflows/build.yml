@@ -71,7 +71,7 @@ jobs:
           mkdir -p work/armbian/cache/ccache
           echo "max_size = 3G" > work/armbian/cache/ccache/ccache.conf
 
-      - uses: jdx/mise-action@924e7c586e33d7d4bae9c14e26c5d22e2beb6e78 # v5.3.0
+      - uses: jdx/mise-action@3277a0f272901982804abc53abd93520db809be4 # v5.4.0
 
       - name: Build
         id: build
@@ -135,7 +135,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: jdx/mise-action@924e7c586e33d7d4bae9c14e26c5d22e2beb6e78 # v5.3.0
+      - uses: jdx/mise-action@3277a0f272901982804abc53abd93520db809be4 # v5.4.0
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
